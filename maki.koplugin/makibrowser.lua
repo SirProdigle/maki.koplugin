@@ -2007,66 +2007,80 @@ function OPDSBrowser:updateFieldInCatalog(item, name, value)
 end
 
 function OPDSBrowser:checkSyncDownload(idx, auto_sync)
-    logger.info("OPDS: checkSyncDownload called, sync_dir =", self.settings.sync_dir)
-    if self.settings.sync_dir then
-        logger.info("OPDS: Starting sync process")
-        self.sync = true
-        local info
-        if not auto_sync then
-            info = InfoMessage:new{
-                text = _("Synchronizing lists…"),
-            }
-            UIManager:show(info)
-            UIManager:forceRePaint()
-        end
-        if idx then
-            self:fillPendingSyncs(self.servers[idx-1]) -- First item is "Downloads"
-        else
-            for _, item in ipairs(self.servers) do
-                if item.sync then
-                    self:fillPendingSyncs(item)
-                end
-            end
-        end
-        if not auto_sync and info then
-            UIManager:close(info)
-        end
+    -- Maki: a single-server sync needs THAT server's sync_dir (or the global
+    -- fallback). A multi-server sync needs at least one sync-flagged server
+    -- to have a usable sync_dir. The upstream gate only checked the global
+    -- setting, which incorrectly blocked per-server sync configurations.
+    local function server_has_dir(srv)
+        return srv and (srv.sync_dir or self.settings.sync_dir)
+    end
 
-        if #self.pending_syncs > 0 then
-            logger.info("OPDS: Found", #self.pending_syncs, "items to download")
-            Trapper:wrap(function()
-                local success, err = pcall(function()
-                    self:downloadPendingSyncs(auto_sync)
-                end)
-                if not success then
-                    logger.err("OPDS: Download failed:", err)
-                end
-                -- Always update last sync time
-                self.settings.last_sync_time = os.time()
-                self._manager.updated = true
-                self._manager:saveSettings()
-                logger.info("OPDS: Sync completed with downloads")
-            end)
-        else
-            -- Only show "Up to date!" for manual sync
-            if not auto_sync then
-                UIManager:show(InfoMessage:new{
-                    text = _("Up to date!"),
-                })
+    local can_sync = false
+    if idx then
+        can_sync = server_has_dir(self.servers[idx-1])
+    else
+        for _, srv in ipairs(self.servers) do
+            if srv.sync and server_has_dir(srv) then
+                can_sync = true
+                break
             end
-            logger.info("OPDS: Sync complete - up to date")
-            -- Update last sync time even if nothing new
+        end
+    end
+
+    if not can_sync then
+        logger.info("Maki: no syncable server (idx=" .. tostring(idx) .. ")")
+        if not auto_sync then
+            UIManager:show(InfoMessage:new{
+                text = _("No sync folder configured for this catalog. Long-press the catalog → Edit → Set sync folder."),
+            })
+        end
+        return
+    end
+
+    logger.info("Maki: starting sync, idx=" .. tostring(idx))
+    self.sync = true
+    local info
+    if not auto_sync then
+        info = InfoMessage:new{ text = _("Synchronizing lists…") }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+    end
+
+    if idx then
+        self:fillPendingSyncs(self.servers[idx-1]) -- First item is "Downloads"
+    else
+        for _, item in ipairs(self.servers) do
+            if item.sync then
+                self:fillPendingSyncs(item)
+            end
+        end
+    end
+
+    if not auto_sync and info then UIManager:close(info) end
+
+    if #self.pending_syncs > 0 then
+        logger.info("Maki: queued", #self.pending_syncs, "downloads")
+        Trapper:wrap(function()
+            local success, err = pcall(function()
+                self:downloadPendingSyncs(auto_sync)
+            end)
+            if not success then
+                logger.err("Maki: download failed:", err)
+            end
             self.settings.last_sync_time = os.time()
             self._manager.updated = true
-        end
-        self.sync = false
-        logger.info("OPDS: Sync flag reset")
+            self._manager:saveSettings()
+            logger.info("Maki: sync done")
+        end)
     else
-        logger.info("OPDS: No sync directory configured")
-        UIManager:show(InfoMessage:new{
-            text = _("Please choose a folder for sync downloads first"),
-        })
+        if not auto_sync then
+            UIManager:show(InfoMessage:new{ text = _("Up to date!") })
+        end
+        logger.info("Maki: nothing new to sync")
+        self.settings.last_sync_time = os.time()
+        self._manager.updated = true
     end
+    self.sync = false
 end
 
 -- Maki: hierarchical, breadcrumb-aware fillPendingSyncs.

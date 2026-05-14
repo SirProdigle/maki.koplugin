@@ -206,9 +206,16 @@ function OPDS:performAutoSync()
         logger.info("OPDS: Sync already in progress, skipping")
         return
     end
-    -- Check if we have a sync directory configured
-    if not self.settings.sync_dir then
-        logger.info("OPDS: No sync directory configured, skipping auto-sync")
+    -- Maki: gate on per-server sync_dir, not the (often-unset) global one.
+    local has_syncable = false
+    for _, srv in ipairs(self.servers) do
+        if srv.sync and (srv.sync_dir or self.settings.sync_dir) then
+            has_syncable = true
+            break
+        end
+    end
+    if not has_syncable then
+        logger.info("Maki: no sync-flagged server with a sync_dir, skipping auto-sync")
         return
     end
 
