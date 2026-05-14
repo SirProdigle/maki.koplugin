@@ -844,11 +844,46 @@ function OPDSBrowser:getServerFileName(item_url, filetype)
         logger.dbg("OPDSBrowser: server file headers", socketutil.redact_headers(headers))
         local disposition = headers["content-disposition"]
         if disposition then
-            -- Try to get filename inside quotes (can contain spaces)
-            filename = disposition:match('filename="([^"]+)"')
-            if not filename then
-                -- Fallback: try filename without quotes, until end or semicolon
-                filename = disposition:match('filename=([^;]+)')
+            -- Maki: prefer RFC 5987 `filename*=UTF-8''<percent-encoded>` over
+            -- the legacy `filename="..."` form. Komga (and others) emit both:
+            --   filename="=?UTF-8?Q?Official=5FChapter_2.cbz?="; filename*=UTF-8''Official_Chapter%202.cbz
+            -- The RFC 5987 value is plain percent-encoded UTF-8 — no RFC 2047
+            -- email-header gymnastics needed.
+            filename = disposition:match("filename%*=[^']*''([^;]+)")
+            if filename then
+                filename = filename:gsub("%%(%x%x)", function(h)
+                    return string.char(tonumber(h, 16))
+                end)
+            else
+                -- Fall back to filename="..." or filename=...
+                filename = disposition:match('filename="([^"]+)"')
+                if not filename then
+                    filename = disposition:match("filename=([^;]+)")
+                end
+                -- Decode RFC 2047 encoded-word (=?charset?Q?text?= / ...?B?text?=)
+                -- so we don't end up with file system names like
+                -- "=_UTF-8_Q_Official=5FChapter_2.cbz_=" (what happens when the
+                -- raw encoded-word reaches util.getSafeFilename and `?` gets
+                -- stripped as an illegal FAT32 char).
+                if filename then
+                    local cs, enc, payload = filename:match("^=%?([^?]+)%?([QqBb])%?(.-)%?=$")
+                    if cs and enc and payload then
+                        local lower_enc = enc:lower()
+                        if lower_enc == "q" then
+                            payload = payload:gsub("_", " ")
+                            payload = payload:gsub("=(%x%x)", function(h)
+                                return string.char(tonumber(h, 16))
+                            end)
+                            filename = payload
+                        elseif lower_enc == "b" then
+                            local ok, b = pcall(require, "base64")
+                            if ok and b and b.decode then
+                                local decoded = b.decode(payload)
+                                if decoded then filename = decoded end
+                            end
+                        end
+                    end
+                end
             end
         end
 
