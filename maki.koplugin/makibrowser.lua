@@ -1538,60 +1538,91 @@ function OPDSBrowser:onMenuSelect(item)
     return true
 end
 
--- Menu action on item long-press (dialog Edit / Delete catalog)
+-- Menu action on item long-press
+-- Root list:    Force sync / Sync / Edit / Delete (existing behavior).
+-- Inside catalog, navigation entry: Maki "Download all here" — bulk-download every
+-- acquisition under this folder into <sync_dir>/<folder name>/<sub.../>file.
 function OPDSBrowser:onMenuHold(item)
-    if #self.paths > 0 or item.idx == 1 then return true end -- not root list or Downloads item
+    -- At root: keep existing catalog-management dialog.
+    if #self.paths == 0 then
+        if item.idx == 1 then return true end -- Downloads item, skip
+        local dialog
+        dialog = ButtonDialog:new{
+            title = item.text,
+            title_align = "center",
+            buttons = {
+                {
+                    {
+                        text = _("Force sync"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            NetworkMgr:runWhenConnected(function()
+                                self.sync_force = true
+                                self:checkSyncDownload(item.idx)
+                            end)
+                        end,
+                    },
+                    {
+                        text = _("Sync"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            NetworkMgr:runWhenConnected(function()
+                                self.sync_force = false
+                                self:checkSyncDownload(item.idx)
+                            end)
+                        end,
+                    },
+                },
+                {},
+                {
+                    {
+                        text = _("Delete"),
+                        callback = function()
+                            UIManager:show(ConfirmBox:new{
+                                text = _("Delete OPDS catalog?"),
+                                ok_text = _("Delete"),
+                                ok_callback = function()
+                                    UIManager:close(dialog)
+                                    self:deleteCatalog(item)
+                                end,
+                            })
+                        end,
+                    },
+                    {
+                        text = _("Edit"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            self:addEditCatalog(item)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+        return true
+    end
+
+    -- Inside a catalog. Only offer bulk download for navigation/folder entries.
+    if item.acquisitions and item.acquisitions[1] then
+        return true -- book entry; nothing to long-press for
+    end
+    if not item.url then return true end
+
     local dialog
     dialog = ButtonDialog:new{
-        title = item.text,
+        title = item.title or item.text,
         title_align = "center",
-        buttons = {
+        buttons = {{
             {
-                {
-                    text = _("Force sync"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        NetworkMgr:runWhenConnected(function()
-                            self.sync_force = true
-                            self:checkSyncDownload(item.idx)
-                        end)
-                    end,
-                },
-                {
-                    text = _("Sync"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        NetworkMgr:runWhenConnected(function()
-                            self.sync_force = false
-                            self:checkSyncDownload(item.idx)
-                        end)
-                    end,
-                },
+                text = _("Download all here"),
+                callback = function()
+                    UIManager:close(dialog)
+                    NetworkMgr:runWhenConnected(function()
+                        self:downloadAllHere(item)
+                    end)
+                end,
             },
-            {},
-            {
-                {
-                    text = _("Delete"),
-                    callback = function()
-                        UIManager:show(ConfirmBox:new{
-                            text = _("Delete OPDS catalog?"),
-                            ok_text = _("Delete"),
-                            ok_callback = function()
-                                UIManager:close(dialog)
-                                self:deleteCatalog(item)
-                            end,
-                        })
-                    end,
-                },
-                {
-                    text = _("Edit"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        self:addEditCatalog(item)
-                    end,
-                },
-            },
-        },
+        }},
     }
     UIManager:show(dialog)
     return true
@@ -2261,4 +2292,172 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
     end
     logger.info("OPDS: downloadPendingSyncs fully completed")
 end
+
+-- ─── Maki: bulk download with breadcrumb-based folder structure ─────────────
+
+-- Find the currently-entered root server config by title.
+function OPDSBrowser:getCurrentServer()
+    if not self.root_catalog_title then return nil end
+    for _, server in ipairs(self.servers) do
+        if server.title == self.root_catalog_title then return server end
+    end
+    return nil
+end
+
+-- Sanitize a single path segment for filesystem use (no slashes, trimmed).
+local function sanitize_segment(name)
+    if not name or name == "" then return "Untitled" end
+    -- Strip leading/trailing whitespace
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    -- Replace path separators and other troublesome characters
+    name = name:gsub("[/\\%z%c]", "_")
+    -- Avoid filenames that fight Windows mass-storage (mostly belt-and-braces on Kindle/Kobo)
+    name = name:gsub("[<>:\"|%?%*]", "_")
+    if name == "" or name == "." or name == ".." then return "Untitled" end
+    return name
+end
+
+-- Recursively walk an OPDS feed, collecting downloadable acquisitions plus the
+-- breadcrumb (folder names) that describe where each one should go on disk.
+-- Stops walking once `limit` items have been collected.
+function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit)
+    if #results >= limit then return end
+    local item_table = self:genItemTableFromURL(item_url)
+    if not item_table then return end
+    for _, item in ipairs(item_table) do
+        if #results >= limit then return end
+        if item.acquisitions and item.acquisitions[1] then
+            -- Acquisition entry: pick the first viable file link.
+            for _, acq in ipairs(item.acquisitions) do
+                if acq.href and acq.type and acq.type ~= "borrow" then
+                    local filetype = OPDSBrowser.getFiletype(acq)
+                    if filetype then
+                        table.insert(results, {
+                            url        = acq.href,
+                            title      = item.title or item.text or "Untitled",
+                            filetype   = filetype,
+                            breadcrumb = breadcrumb,
+                        })
+                        break
+                    end
+                end
+            end
+        elseif item.url then
+            -- Navigation entry: recurse into the sub-feed with the entry's
+            -- title appended to the breadcrumb so its contents nest below it.
+            local new_crumb = {}
+            for _, c in ipairs(breadcrumb) do table.insert(new_crumb, c) end
+            table.insert(new_crumb, sanitize_segment(item.title or item.text))
+            self:walkFeedForBulk(item.url, new_crumb, results, limit)
+        end
+    end
+    -- Follow rel=next pagination for the same level.
+    if item_table.hrefs and item_table.hrefs.next and #results < limit then
+        self:walkFeedForBulk(item_table.hrefs.next, breadcrumb, results, limit)
+    end
+end
+
+-- Long-press → "Download all here" entry point.
+-- `item` is a navigation entry; we walk its subtree and download every file
+-- into <server_sync_dir>/<item.title>/<…sub-breadcrumb…>/file.ext.
+function OPDSBrowser:downloadAllHere(item)
+    local server = self:getCurrentServer()
+    local base_dir = (server and server.sync_dir) or self.settings.sync_dir
+    if not base_dir or base_dir == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("No sync folder set for this catalog.\n\nLong-press the catalog at the root list and choose 'Set sync folder', or set a global sync folder under Maki settings."),
+        })
+        return
+    end
+
+    local seed_title = sanitize_segment(item.title or item.text)
+    local start_url = item.url
+    local breadcrumb = { seed_title }
+
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Bulk-download everything inside '%1' into:\n%2/%3/"),
+                 item.title or item.text, base_dir, seed_title),
+        ok_text = _("Download"),
+        ok_callback = function()
+            Trapper:wrap(function()
+                self:runBulkDownload(start_url, breadcrumb, base_dir)
+            end)
+        end,
+    })
+end
+
+-- Scan the subtree, plan target paths, then download in a dismissable subprocess.
+function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
+    local LIMIT = 1000
+
+    local scanning = InfoMessage:new{ text = _("Scanning catalog…") }
+    UIManager:show(scanning)
+    UIManager:forceRePaint()
+
+    local results = {}
+    self:walkFeedForBulk(start_url, breadcrumb, results, LIMIT)
+
+    UIManager:close(scanning)
+    UIManager:forceRePaint()
+
+    if #results == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No downloadable files found here.") })
+        return
+    end
+
+    -- Plan each file's target path.
+    local plan = {}
+    for _, r in ipairs(results) do
+        local parts = { base_dir }
+        for _, c in ipairs(r.breadcrumb) do
+            table.insert(parts, c)
+        end
+        local target_dir = table.concat(parts, "/"):gsub("//+", "/")
+        local filename = self:getServerFileName(r.url, r.filetype)
+        filename = util.getSafeFilename(filename, target_dir)
+        local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
+        table.insert(plan, {
+            url      = r.url,
+            file     = target_path,
+            dir      = target_dir,
+            username = self.root_catalog_username,
+            password = self.root_catalog_password,
+        })
+    end
+
+    local progress = InfoMessage:new{
+        text = T(_("Downloading %1 files… (tap to cancel)"), #plan),
+    }
+    UIManager:show(progress)
+    UIManager:forceRePaint()
+
+    local completed, dl_count, skip_count, fail_count = Trapper:dismissableRunInSubprocess(function()
+        local downloaded = 0
+        local skipped    = 0
+        local failed     = 0
+        for _, p in ipairs(plan) do
+            util.makePath(p.dir)
+            if lfs.attributes(p.file) then
+                skipped = skipped + 1
+            else
+                if self:downloadFile(p.file, p.url, p.username, p.password) then
+                    downloaded = downloaded + 1
+                else
+                    failed = failed + 1
+                end
+            end
+        end
+        return downloaded, skipped, failed
+    end, progress)
+
+    if completed then UIManager:close(progress) end
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("Maki: bulk download finished.\n%1 downloaded\n%2 already present\n%3 failed\nInto: %4"),
+                 dl_count or 0, skip_count or 0, fail_count or 0, base_dir),
+        timeout = 6,
+    })
+    self._manager.updated = true
+end
+
 return OPDSBrowser
