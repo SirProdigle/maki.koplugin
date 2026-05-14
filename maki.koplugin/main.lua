@@ -3,7 +3,7 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Dispatcher = require("dispatcher")
 local LuaSettings = require("luasettings")
-local OPDSBrowser = require("opdsbrowser")
+local OPDSBrowser = require("makibrowser")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local util = require("util")
@@ -12,8 +12,8 @@ local T = require("ffi/util").template
 local logger = require("logger")
 
 local OPDS = WidgetContainer:extend{
-    name = "opds",
-    opds_settings_file = DataStorage:getSettingsDir() .. "/opds.lua",
+    name = "maki",
+    opds_settings_file = DataStorage:getSettingsDir() .. "/maki.lua",
     settings = nil,
     servers = nil,
     downloads = nil,
@@ -86,23 +86,23 @@ function OPDS:init()
 end
 
 function OPDS:onDispatcherRegisterActions()
-    Dispatcher:registerAction("opds_show_catalog",
-        {category="none", event="ShowOPDSCatalog", title=_("OPDS Catalog"), filemanager=true,}
+    Dispatcher:registerAction("maki_show_catalog",
+        {category="none", event="ShowMakiCatalog", title=_("Maki catalog"), filemanager=true,}
     )
 end
 
 function OPDS:addToMainMenu(menu_items)
     if not self.ui.document then -- FileManager menu only
-        menu_items.opds = {
-            text = _("OPDS catalog"),
+        menu_items.maki = {
+            text = _("Maki (OPDS+)"),
             callback = function()
-                self:onShowOPDSCatalog()
+                self:onShowMakiCatalog()
             end,
         }
     end
 end
 
-function OPDS:onShowOPDSCatalog()
+function OPDS:onShowMakiCatalog()
     self.opds_browser = OPDSBrowser:new{
         servers = self.servers,
         downloads = self.downloads,
