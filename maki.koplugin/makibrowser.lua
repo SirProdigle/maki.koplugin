@@ -2074,48 +2074,57 @@ function OPDSBrowser:checkSyncDownload(idx, auto_sync)
 
     logger.info("Maki: starting sync, idx=" .. tostring(idx))
     self.sync = true
-    local info
-    if not auto_sync then
-        info = InfoMessage:new{ text = _("Synchronizing lists…") }
-        UIManager:show(info)
-        UIManager:forceRePaint()
-    end
 
-    if idx then
-        self:fillPendingSyncs(self.servers[idx-1]) -- First item is "Downloads"
-    else
-        for _, item in ipairs(self.servers) do
-            if item.sync then
-                self:fillPendingSyncs(item)
+    -- Wrap the entire sync (scan + download) in one Trapper coroutine so
+    -- Trapper:info can drive a single live progress widget through both
+    -- phases — both for manual sync and auto-sync.
+    Trapper:wrap(function()
+        local progress_cb
+        if not auto_sync then
+            local last_label
+            progress_cb = function(count, where)
+                if where ~= last_label or count % 25 == 0 then
+                    last_label = where
+                    return Trapper:info(T(_("Scanning: %1\n%2 file(s) found"), where, count))
+                end
+                return true
+            end
+            Trapper:info(_("Scanning catalog…"))
+        end
+
+        if idx then
+            self:fillPendingSyncs(self.servers[idx-1], progress_cb)
+        else
+            for _, item in ipairs(self.servers) do
+                if item.sync then
+                    self:fillPendingSyncs(item, progress_cb)
+                end
             end
         end
-    end
 
-    if not auto_sync and info then UIManager:close(info) end
-
-    if #self.pending_syncs > 0 then
-        logger.info("Maki: queued", #self.pending_syncs, "downloads")
-        Trapper:wrap(function()
+        if #self.pending_syncs > 0 then
+            logger.info("Maki: queued", #self.pending_syncs, "downloads")
             local success, err = pcall(function()
                 self:downloadPendingSyncs(auto_sync)
             end)
             if not success then
                 logger.err("Maki: download failed:", err)
             end
-            self.settings.last_sync_time = os.time()
-            self._manager.updated = true
-            self._manager:saveSettings()
-            logger.info("Maki: sync done")
-        end)
-    else
-        if not auto_sync then
-            UIManager:show(InfoMessage:new{ text = _("Up to date!") })
+        else
+            if not auto_sync then
+                Trapper:reset()
+                UIManager:show(InfoMessage:new{ text = _("Up to date!") })
+            end
+            logger.info("Maki: nothing new to sync")
         end
-        logger.info("Maki: nothing new to sync")
+
         self.settings.last_sync_time = os.time()
         self._manager.updated = true
-    end
-    self.sync = false
+        self._manager:saveSettings()
+        if not auto_sync then Trapper:reset() end
+        self.sync = false
+        logger.info("Maki: sync done")
+    end)
 end
 
 -- Maki: hierarchical, breadcrumb-aware fillPendingSyncs.
@@ -2136,7 +2145,7 @@ end
 -- perf optimization for big flat catalogs (e.g. Project Gutenberg); for
 -- the hierarchical server-library case this isn't needed and the file
 -- system is the source of truth instead.
-function OPDSBrowser:fillPendingSyncs(server)
+function OPDSBrowser:fillPendingSyncs(server, on_scan_progress)
     self.root_catalog_password  = server.password
     self.root_catalog_raw_names = server.raw_names
     self.root_catalog_username  = server.username
@@ -2164,7 +2173,7 @@ function OPDSBrowser:fillPendingSyncs(server)
     -- Downloads are capped separately by sync_max_dl below.
     local results = {}
     local walk_limit = 5000
-    self:walkFeedForBulk(server.url, {}, results, walk_limit)
+    self:walkFeedForBulk(server.url, {}, results, walk_limit, on_scan_progress)
 
     local queued = 0
     for _, r in ipairs(results) do
@@ -2268,64 +2277,66 @@ function OPDSBrowser:getSyncDownloadList(url_arg)
     return sync_table
 end
 
--- Download pending syncs list
+-- Download pending syncs list. Must be called inside Trapper:wrap.
+-- For manual sync, drives a live "Downloading i / N" widget via Trapper:info
+-- (tap to cancel). For auto-sync, runs silently without UI updates.
 function OPDSBrowser:downloadPendingSyncs(auto_sync)
     local dl_list = self.pending_syncs
+
     local function dismissable_download()
-        local info = nil -- Default to nil for auto-sync
-        if not auto_sync then
-            info = InfoMessage:new{ text = _("Downloading… (tap to cancel)") }
-            UIManager:show(info)
-            UIManager:forceRePaint()
-        end
-        local completed, downloaded, duplicate_list = Trapper:dismissableRunInSubprocess(function()
-            local dl = {}
-            local dupe_list = {}
-            for _, item in ipairs(dl_list) do
-                if self.sync_server_list[item.catalog] then
-                    if lfs.attributes(item.file) and not self.sync_force then
-                        table.insert(dupe_list, item)
-                    else
-                        if self:downloadFile(item.file, item.url, item.username, item.password) then
-                            dl[item.file] = true
-                        end
+        local total = #dl_list
+        local downloaded_set = {}
+        local duplicate_list = {}
+        local cancelled = false
+
+        for i, item in ipairs(dl_list) do
+            if self.sync_server_list[item.catalog] then
+                if lfs.attributes(item.file) and not self.sync_force then
+                    table.insert(duplicate_list, item)
+                else
+                    if not auto_sync then
+                        local short = item.file:match("[^/]+$") or item.file
+                        local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
+                        if go == false then cancelled = true; break end
+                    end
+                    if self:downloadFile(item.file, item.url, item.username, item.password) then
+                        downloaded_set[item.file] = true
                     end
                 end
             end
-            return dl, dupe_list
-        end, info) -- Pass info directly (nil for auto-sync)
-
-        if completed and info then
-            UIManager:close(info)
         end
+
+        if not auto_sync then Trapper:reset() end
+
         local dl_count = 0
-        local dl_size = #dl_list
-        for i = dl_size, 1, -1 do
-            local item = dl_list[i]
-            if downloaded and downloaded[item.file] then
+        for j = #dl_list, 1, -1 do
+            local item = dl_list[j]
+            if downloaded_set[item.file] then
                 dl_count = dl_count + 1
-                table.remove(dl_list, i)
-            else -- if subprocess has been interrupted, check for the downloaded file
+                table.remove(dl_list, j)
+            elseif cancelled then
+                -- File may have been partially written before we broke out.
                 local attr = lfs.attributes(item.file)
                 if attr then
                     if attr.size > 0 then
-                        table.remove(dl_list, i)
-                        if attr.modification > os.time() - 300 then -- Only count files touched in the last 5 mins
+                        table.remove(dl_list, j)
+                        if attr.modification > os.time() - 300 then
                             dl_count = dl_count + 1
                         end
-                    else -- incomplete download
+                    else
                         os.remove(item.file)
                     end
                 end
             end
         end
+
         local duplicate_count = duplicate_list and #duplicate_list or 0
         dl_count = dl_count - duplicate_count
         if dl_count > 0 then
             UIManager:show(Notification:new{
                 text = T(N_("1 book downloaded", "%1 books downloaded", dl_count), dl_count)
             })
-            logger.info("OPDS: Download completed -", dl_count, "books")
+            logger.info("Maki: download completed -", dl_count, "books")
         end
         self._manager.updated = true
         return duplicate_list
@@ -2411,12 +2422,22 @@ end
 -- Recursively walk an OPDS feed, collecting downloadable acquisitions plus the
 -- breadcrumb (folder names) that describe where each one should go on disk.
 -- Stops walking once `limit` items have been collected.
-function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit)
-    if #results >= limit then return end
+function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_progress)
+    if #results >= limit or results._cancelled then return end
+
+    -- Tell the caller what we're about to scan. on_progress can return false
+    -- to abort (the user tapped the InfoMessage and confirmed cancel).
+    if on_progress then
+        local where = breadcrumb[#breadcrumb] or self.root_catalog_title or "catalog"
+        local go = on_progress(#results, where)
+        if go == false then results._cancelled = true; return end
+    end
+
     local item_table = self:genItemTableFromURL(item_url)
     if not item_table then return end
+
     for _, item in ipairs(item_table) do
-        if #results >= limit then return end
+        if #results >= limit or results._cancelled then return end
         if item.acquisitions and item.acquisitions[1] then
             -- Acquisition entry: pick the first viable file link.
             for _, acq in ipairs(item.acquisitions) do
@@ -2439,12 +2460,12 @@ function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit)
             local new_crumb = {}
             for _, c in ipairs(breadcrumb) do table.insert(new_crumb, c) end
             table.insert(new_crumb, sanitize_segment(item.title or item.text))
-            self:walkFeedForBulk(item.url, new_crumb, results, limit)
+            self:walkFeedForBulk(item.url, new_crumb, results, limit, on_progress)
         end
     end
     -- Follow rel=next pagination for the same level.
-    if item_table.hrefs and item_table.hrefs.next and #results < limit then
-        self:walkFeedForBulk(item_table.hrefs.next, breadcrumb, results, limit)
+    if item_table.hrefs and item_table.hrefs.next and #results < limit and not results._cancelled then
+        self:walkFeedForBulk(item_table.hrefs.next, breadcrumb, results, limit, on_progress)
     end
 end
 
@@ -2477,26 +2498,35 @@ function OPDSBrowser:downloadAllHere(item)
     })
 end
 
--- Scan the subtree, plan target paths, then download in a dismissable subprocess.
+-- Scan the subtree, plan target paths, then download sequentially with live
+-- progress driven by Trapper:info. Must be called inside Trapper:wrap.
 function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
-    local LIMIT = 1000
+    local LIMIT = 5000
 
-    local scanning = InfoMessage:new{ text = _("Scanning catalog…") }
-    UIManager:show(scanning)
-    UIManager:forceRePaint()
-
+    -- Scan phase. Trapper:info updates as we descend into each subfeed.
+    Trapper:info(_("Scanning catalog…"))
     local results = {}
-    self:walkFeedForBulk(start_url, breadcrumb, results, LIMIT)
+    local last_label
+    local function scan_progress(count, where)
+        if where ~= last_label or count % 25 == 0 then
+            last_label = where
+            return Trapper:info(T(_("Scanning: %1\n%2 file(s) found"), where, count))
+        end
+        return true
+    end
+    self:walkFeedForBulk(start_url, breadcrumb, results, LIMIT, scan_progress)
 
-    UIManager:close(scanning)
-    UIManager:forceRePaint()
-
+    if results._cancelled then
+        Trapper:reset()
+        return
+    end
     if #results == 0 then
+        Trapper:reset()
         UIManager:show(InfoMessage:new{ text = _("No downloadable files found here.") })
         return
     end
 
-    -- Plan each file's target path.
+    -- Plan target paths.
     local plan = {}
     for _, r in ipairs(results) do
         local parts = { base_dir }
@@ -2516,36 +2546,30 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
         })
     end
 
-    local progress = InfoMessage:new{
-        text = T(_("Downloading %1 files… (tap to cancel)"), #plan),
-    }
-    UIManager:show(progress)
-    UIManager:forceRePaint()
-
-    local completed, dl_count, skip_count, fail_count = Trapper:dismissableRunInSubprocess(function()
-        local downloaded = 0
-        local skipped    = 0
-        local failed     = 0
-        for _, p in ipairs(plan) do
-            util.makePath(p.dir)
-            if lfs.attributes(p.file) then
-                skipped = skipped + 1
+    -- Download phase. Sequential, one Trapper:info update per file. Tapping
+    -- the widget pops a confirm-cancel dialog (built into Trapper:info).
+    local total = #plan
+    local downloaded, skipped, failed = 0, 0, 0
+    for i, p in ipairs(plan) do
+        local short = p.file:match("[^/]+$") or p.file
+        local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
+        if go == false then break end
+        util.makePath(p.dir)
+        if lfs.attributes(p.file) then
+            skipped = skipped + 1
+        else
+            if self:downloadFile(p.file, p.url, p.username, p.password) then
+                downloaded = downloaded + 1
             else
-                if self:downloadFile(p.file, p.url, p.username, p.password) then
-                    downloaded = downloaded + 1
-                else
-                    failed = failed + 1
-                end
+                failed = failed + 1
             end
         end
-        return downloaded, skipped, failed
-    end, progress)
-
-    if completed then UIManager:close(progress) end
+    end
+    Trapper:reset()
 
     UIManager:show(InfoMessage:new{
         text = T(_("Maki: bulk download finished.\n%1 downloaded\n%2 already present\n%3 failed\nInto: %4"),
-                 dl_count or 0, skip_count or 0, fail_count or 0, base_dir),
+                 downloaded, skipped, failed, base_dir),
         timeout = 6,
     })
     self._manager.updated = true
