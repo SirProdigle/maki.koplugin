@@ -15,6 +15,7 @@ local DownloadMgr = require("ui/downloadmgr")
 local Notification = require("ui/widget/notification")
 local OPDSParser = require("makiparser")
 local OPDSPSE = require("makipse")
+local MakiHTTP = require("makihttp")
 local SpinWidget = require("ui/widget/spinwidget")
 local TextViewer = require("ui/widget/textviewer")
 local Trapper = require("ui/trapper")
@@ -2289,6 +2290,22 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
         local duplicate_list = {}
         local cancelled = false
 
+        -- Keepalive HTTPS client cache, one per host. Most syncs hit a single
+        -- server, so this collapses N TLS handshakes to one.
+        local clients = {}
+        local function client_for(item)
+            local base = item.url and item.url:match("^(https://[^/]+)") or nil
+            if not base then return nil end
+            if not clients[base] then
+                clients[base] = MakiHTTP.Client:new{
+                    base_url = base,
+                    username = item.username,
+                    password = item.password,
+                }
+            end
+            return clients[base]
+        end
+
         for i, item in ipairs(dl_list) do
             if self.sync_server_list[item.catalog] then
                 if lfs.attributes(item.file) and not self.sync_force then
@@ -2299,13 +2316,20 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
                         local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
                         if go == false then cancelled = true; break end
                     end
-                    if self:downloadFile(item.file, item.url, item.username, item.password) then
-                        downloaded_set[item.file] = true
+                    local ka = client_for(item)
+                    local ok = false
+                    if ka then ok = ka:downloadURL(item.url, item.file) end
+                    if ok == nil or ok == false then
+                        -- Fall back to one-shot socket.http if keepalive client
+                        -- isn't applicable (http://, host mismatch) or failed.
+                        ok = self:downloadFile(item.file, item.url, item.username, item.password)
                     end
+                    if ok then downloaded_set[item.file] = true end
                 end
             end
         end
 
+        for _, c in pairs(clients) do c:close() end
         if not auto_sync then Trapper:reset() end
 
         local dl_count = 0
@@ -2548,8 +2572,16 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
 
     -- Download phase. Sequential, one Trapper:info update per file. Tapping
     -- the widget pops a confirm-cancel dialog (built into Trapper:info).
+    -- A single keepalive HTTPS connection is reused for every file in the
+    -- run — eliminates the per-file TLS handshake (the slowest thing the
+    -- Kindle radio does).
     local total = #plan
     local downloaded, skipped, failed = 0, 0, 0
+    local ka = MakiHTTP.Client:new{
+        base_url = plan[1] and plan[1].url:match("^(https://[^/]+)") or "",
+        username = self.root_catalog_username,
+        password = self.root_catalog_password,
+    }
     for i, p in ipairs(plan) do
         local short = p.file:match("[^/]+$") or p.file
         local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
@@ -2558,13 +2590,25 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
         if lfs.attributes(p.file) then
             skipped = skipped + 1
         else
-            if self:downloadFile(p.file, p.url, p.username, p.password) then
+            local ok = false
+            if ka then
+                ok = ka:downloadURL(p.url, p.file)
+                if ok == nil then
+                    -- Host mismatch (shouldn't happen for a single-catalog
+                    -- bulk download, but fall back just in case).
+                    ok = self:downloadFile(p.file, p.url, p.username, p.password)
+                end
+            else
+                ok = self:downloadFile(p.file, p.url, p.username, p.password)
+            end
+            if ok then
                 downloaded = downloaded + 1
             else
                 failed = failed + 1
             end
         end
     end
+    if ka then ka:close() end
     Trapper:reset()
 
     UIManager:show(InfoMessage:new{
