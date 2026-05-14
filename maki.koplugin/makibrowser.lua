@@ -38,6 +38,17 @@ local CatalogCache = Cache:new{
     slots = 20,
 }
 
+-- Maki: sanitize a single path segment for filesystem use.
+-- Used by both the long-press bulk walker and the single-tap download path.
+local function sanitize_segment(name)
+    if not name or name == "" then return "Untitled" end
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    name = name:gsub("[/\\%z%c]", "_")
+    name = name:gsub("[<>:\"|%?%*]", "_")
+    if name == "" or name == "." or name == ".." then return "Untitled" end
+    return name
+end
+
 local OPDSBrowser = Menu:extend{
     catalog_type         = "application/atom%+xml",
     search_type          = "application/opensearchdescription%+xml",
@@ -1415,20 +1426,47 @@ end
 
 -- Returns user selected or last opened folder
 function OPDSBrowser:getCurrentDownloadDir(item)
-    -- Check if we have a per-catalog sync directory
-    if item and item.sync_dir then
-        return item.sync_dir
+    -- Explicit per-item override wins.
+    if item and item.sync_dir then return item.sync_dir end
+
+    -- Maki: when the user is inside a catalog, mirror the navigation breadcrumb
+    -- into the download path. Single-tap download of a chapter inside
+    -- "Komga: Manga > Chainsaw Man" lands in <sync_dir>/Chainsaw Man/ — matches
+    -- the long-press "Download all here" layout. paths[1] is the root catalog
+    -- itself (we don't want it as a folder) so we start at paths[2].
+    if self.root_catalog_title and self.paths and #self.paths > 0 then
+        local server
+        for _, s in ipairs(self.servers or {}) do
+            if s.title == self.root_catalog_title then server = s break end
+        end
+        local server_dir = server and server.sync_dir
+        if server_dir and server_dir ~= "" then
+            local parts = { server_dir }
+            for i = 2, #self.paths do
+                local title = self.paths[i] and self.paths[i].title
+                if title and title ~= "" then
+                    table.insert(parts, sanitize_segment(title))
+                end
+            end
+            return (table.concat(parts, "/"):gsub("//+", "/"))
+        end
     end
-    -- Fall back to global sync directory
-    if self.settings.sync_dir then
+
+    -- Global sync folder, or last-resort fallbacks so we never return nil.
+    if self.settings and self.settings.sync_dir and self.settings.sync_dir ~= "" then
         return self.settings.sync_dir
     end
-    -- Default download directory
-    return self.download_dir
+    if self.download_dir and self.download_dir ~= "" then return self.download_dir end
+    local home = G_reader_settings:readSetting("home_dir")
+    if home and home ~= "" then return home end
+    return "/"  -- BD.dirpath at least handles this without nil-indexing
 end
 
 function OPDSBrowser:getLocalDownloadPath(server, filename, filetype, remote_url)
     local download_dir = self:getCurrentDownloadDir(server)
+    -- Maki: breadcrumb-aware download dirs nest (e.g. <sync>/Chainsaw Man/).
+    -- mkdir -p so io.open succeeds when the series folder doesn't exist yet.
+    util.makePath(download_dir)
     filename = filename and filename .. "." .. filetype:lower() or self:getServerFileName(remote_url, filetype)
     filename = util.getSafeFilename(filename, download_dir)
     filename = (download_dir ~= "/" and download_dir or "") .. '/' .. filename
@@ -2319,19 +2357,6 @@ function OPDSBrowser:getCurrentServer()
         if server.title == self.root_catalog_title then return server end
     end
     return nil
-end
-
--- Sanitize a single path segment for filesystem use (no slashes, trimmed).
-local function sanitize_segment(name)
-    if not name or name == "" then return "Untitled" end
-    -- Strip leading/trailing whitespace
-    name = name:gsub("^%s+", ""):gsub("%s+$", "")
-    -- Replace path separators and other troublesome characters
-    name = name:gsub("[/\\%z%c]", "_")
-    -- Avoid filenames that fight Windows mass-storage (mostly belt-and-braces on Kindle/Kobo)
-    name = name:gsub("[<>:\"|%?%*]", "_")
-    if name == "" or name == "." or name == ".." then return "Untitled" end
-    return name
 end
 
 -- Recursively walk an OPDS feed, collecting downloadable acquisitions plus the
