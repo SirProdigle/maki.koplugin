@@ -1,92 +1,69 @@
-# OPDSfoldersync - Koreader OPDS Plugin with Per-Catalog Sync
+# Maki 巻
 
-This project provides an enhanced OPDS (Open Publication Distribution System) plugin for Koreader, enabling users to browse, download, and synchronize content from OPDS catalogs. A key feature of this plugin is the ability to configure *per-catalog synchronization folders*, allowing for more organized management of downloaded books and documents.
+A KOReader OPDS catalog plugin with **bulk download by folder** and **breadcrumb-based path layout** — long-press any folder in the catalog, hit "Download all here", and the files land in `<sync_dir>/<folder_title>/<...>/file.ext`.
 
-## Features
+巻 (maki) is the Japanese counter for volumes/scrolls, used for manga and book series (第1巻 = Vol. 1).
 
-*   **Automated Synchronization:** Keep your catalogs synced automatically with periodic and event-based triggers (e.g., on network connection or resume).
-*   **Per-Catalog Sync Folders:** Assign a dedicated synchronization directory for each OPDS catalog, preventing clutter and improving organization of your downloaded files. Falls back to a global sync directory if not set per-catalog.
-*   **Include/Exclude Filters:** Fine-tune your syncs by setting include or exclude filters for authors and categories on a per-catalog basis.
+## Why this exists
 
-## Installation
+Komga and other comic/manga servers expose libraries → series → chapters via OPDS. The vanilla KOReader OPDS browser downloads one file at a time and dumps everything into a single global folder. [OPDSfoldersync](https://github.com/koesac/OPDSfoldersync.koplugin) added per-catalog sync folders, but every download still goes flat into that one folder — no series subfolders, no nesting.
 
-This plugin **replaces and extends** the default OPDS plugin that comes with Koreader. To avoid conflicts, you must remove the original before installing this version.
+Maki adds the missing piece: walk the OPDS subtree from wherever you long-press, and preserve the structure on disk.
 
-1.  **Locate your Koreader installation directory.** This is typically where your `koreader.app` or `koreader.sh` executable resides.
-2.  **Navigate to the `plugins` directory** within your Koreader installation (e.g., `/koreader/plugins/`).
-3.  **Delete the existing `opds.koplugin` directory.** This step is crucial to ensure the new plugin loads correctly.
-4.  **Copy the `opds.koplugin` folder** from this repository directly into Koreader's `plugins` directory.
-    *   Make sure you copy the entire `opds.koplugin` directory, not just its contents.
+## What's different from upstream
 
-Your directory structure should look something like this:
+| Feature | KOReader OPDS | OPDSfoldersync | **Maki** |
+|---|:---:|:---:|:---:|
+| Browse + single-file download | ✅ | ✅ | ✅ |
+| Per-catalog sync folder | ❌ | ✅ | ✅ |
+| Author/category filters | ❌ | ✅ | ✅ |
+| Auto-sync on schedule | ❌ | ✅ | ✅ |
+| Long-press folder → bulk download | ❌ | ❌ | ✅ |
+| Series-subfolder path building | ❌ | ❌ | ✅ |
+| Coexists with built-in OPDS plugin | n/a | ❌ (replaces) | ✅ |
+
+## How "Download all here" works
+
+You're inside an OPDS feed — for example, browsing your Komga "Manga" library which lists series. **Long-press** on "Chainsaw Man". You get:
 
 ```
-/koreader/
-├── plugins/
-│   ├── opds.koplugin/
-│   │   ├── _meta.lua
-│   │   ├── main.lua
-│   │   ├── opdsbrowser.lua
-│   │   ├── opdsparser.lua
-│   │   └── opdspse.lua
-│   └── (other plugins...)
-├── (other Koreader files...)
+┌─ Chainsaw Man ──────────────┐
+│ [ Download all here ]       │
+└─────────────────────────────┘
 ```
 
-5.  **Restart Koreader** to load the new plugin.
+Hit it. Maki:
 
-## Usage
+1. Walks every navigation entry under "Chainsaw Man" (in this case, just the chapter list).
+2. Follows `rel=next` pagination so the full set of chapters is enumerated.
+3. Plans a target path for each acquisition: `<sync_dir>/<folder_title>/<nested.../>file.ext`.
+4. Skips files already on the device.
+5. Downloads sequentially in a dismissable subprocess.
 
-### Adding/Editing an OPDS Catalog
+So a long-press at the Manga-library level gives you `<sync_dir>/Chainsaw Man/Official_Chapter 1.cbz`, `<sync_dir>/Chainsaw Man/Official_Chapter 2.cbz`, etc. Long-press at the all-libraries level, and each series gets its own subfolder under the sync root.
 
-1.  From the Koreader file browser, access the **"Network"** menu (usually a Wi-Fi or globe icon).
-2.  Select **"OPDS"**.
-3.  Choose **"Add new catalog"** or select an existing catalog and choose **"Edit catalog"**.
-4.  Fill in the catalog details (Name, URL, Username, Password).
-5.  **Sync Catalog:** Check this option if you want Koreader to automatically synchronize content from this catalog.
-6.  **Set Sync Folder:** A new button labeled "Set sync folder" (or "Sync folder: [path]" if already set) will allow you to choose a specific directory on your device where books from *this catalog* will be downloaded. If left unset, the global sync folder or default download directory will be used.
-7.  Tap **"Save"**.
+The breadcrumb is built from where you triggered the action, not from the entire navigation chain — predictable and intuitive.
 
-### Filtering
+## Install
 
-You can control which books are synced from a catalog by setting filters for authors and categories. These filters can be accessed when adding or editing a catalog.
+Maki coexists with the built-in `opds.koplugin`. You don't have to remove anything.
 
-*   **Excluded Authors/Categories:** A comma-separated list of authors or categories to exclude from synchronization.
-*   **Included Authors/Categories:** A comma-separated list of authors or categories to include in synchronization. If this is set, only items that match will be synced.
+1. Copy the `maki.koplugin/` directory into your KOReader plugins folder:
+   - Kindle: `/mnt/us/koreader/plugins/maki.koplugin/`
+   - Kobo: `/mnt/onboard/.adds/koreader/plugins/maki.koplugin/`
+   - Desktop: `<koreader-dir>/plugins/maki.koplugin/`
+2. Restart KOReader.
+3. Enable under **Plugin management → Maki**.
+4. Add catalogs via the File Manager menu → **Maki (OPDS+)**.
 
-**Filter Precedence:**
+Settings (sync folder, max sync downloads, filters, auto-sync interval) live under **Maki (OPDS+) → ⚙**.
 
-The include and exclude filters work together to give you fine-grained control. Here's how they interact:
+## Credits
 
-| Included Authors/Categories | Excluded Authors/Categories | Behavior                                                                                                                              |
-| --------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Not Set                     | Not Set                     | All books from the catalog are synced.                                                                                                |
-| Not Set                     | Set                         | All books are synced, *except* those matching the excluded authors/categories.                                                        |
-| Set                         | Not Set                     | Only books matching the included authors/categories are synced.                                                                       |
-| Set                         | Set                         | Only books matching the included authors/categories are considered. From that set, any books matching the excluded list are removed. |
+- The OPDS browser core is the [KOReader OPDS plugin](https://github.com/koreader/koreader/tree/master/plugins/opds.koplugin) (AGPL-3.0).
+- The per-catalog sync layer is from [koesac/OPDSfoldersync.koplugin](https://github.com/koesac/OPDSfoldersync.koplugin).
+- Maki adds the bulk-download-with-breadcrumb-folders feature on top.
 
-For example, if you include the category "Science Fiction" and exclude the author "John Doe", you will get all science fiction books except for those written by John Doe.
+## License
 
-### Automated Synchronization
-
-This plugin now supports automated synchronization to keep your library up-to-date without manual intervention.
-
-*   **How it Works:** When enabled, auto-sync will periodically check for new content in your synced catalogs. By default, this check occurs every 24 hours.
-*   **Event-Based Triggers:** In addition to the periodic sync, the plugin will also trigger a sync when:
-    *   Your device connects to a network.
-    *   Your device resumes from sleep.
-*   **Configuration:** You can manage auto-sync directly from the OPDS catalog menu:
-    *   **Auto-sync: On/Off:** Toggle the automated synchronization feature. It is enabled by default.
-    *   **Last sync:** Displays the date and time of the last successful synchronization.
-
-### Synchronization
-
-*   When "Sync Catalog" is enabled for a catalog, Koreader will attempt to download new items from that catalog into its designated sync folder.
-*   The plugin prioritizes the per-catalog sync folder. If not set, it falls back to the global `sync_dir` setting (if configured in Koreader settings), and finally to Koreader's default download directory.
-
-## Configuration
-
-Global OPDS settings, such as a default synchronization directory for all catalogs, can typically be found within Koreader's general settings under "Network" or "OPDS". However, the per-catalog setting introduced by this plugin will override the global setting for specific catalogs.
-
----
-**Note:** This plugin assumes a Koreader environment capable of running Lua plugins and accessing the file system.
+AGPL-3.0 (inherited from KOReader, see [LICENSE](LICENSE)).
