@@ -2031,7 +2031,24 @@ function OPDSBrowser:checkSyncDownload(idx, auto_sync)
     end
 end
 
--- Add entries to self.pending_syncs
+-- Maki: hierarchical, breadcrumb-aware fillPendingSyncs.
+--
+-- Walks the server's OPDS tree (navigation entries + acquisition entries +
+-- rel=next pagination), builds target paths that preserve folder structure
+-- (<sync_dir>/<series>/<file>.ext), and queues acquisitions that are
+-- (a) destined for a folder that already exists on disk, and
+-- (b) not already on disk themselves.
+--
+-- "Existing folder only" is intentional — it means new chapters arrive in
+-- series the user has already pulled, but brand-new series don't auto-spawn
+-- on the device. To start syncing a new series, do one manual long-press
+-- "Download all here" to create the folder; subsequent runs will keep it
+-- up to date.
+--
+-- This replaces the upstream flat, cursor-based logic. The cursor was a
+-- perf optimization for big flat catalogs (e.g. Project Gutenberg); for
+-- the hierarchical server-library case this isn't needed and the file
+-- system is the source of truth instead.
 function OPDSBrowser:fillPendingSyncs(server)
     self.root_catalog_password  = server.password
     self.root_catalog_raw_names = server.raw_names
@@ -2041,63 +2058,63 @@ function OPDSBrowser:fillPendingSyncs(server)
     self.sync_server_list       = self.sync_server_list or {}
     self.sync_max_dl            = self.settings.sync_max_dl or 50
 
+    local sync_dir = server.sync_dir or self.settings.sync_dir
+    if not sync_dir or sync_dir == "" then
+        logger.warn("Maki: server", server.title, "has no sync_dir, skipping")
+        return
+    end
+
     local file_list
     local file_str = self.settings.filetypes
-    local new_last_download = nil
-    local dl_count = 1
     if file_str then
         file_list = {}
         for filetype in util.gsplit(file_str, ",") do
             file_list[util.trim(filetype)] = true
         end
     end
-    local sync_list = self:getSyncDownloadList()
-    if sync_list then
-        for i, entry in ipairs(sync_list) do
-            -- for project gutenberg
-            local sub_table = {}
-            local item
-            if entry.url then
-                sub_table = self:getSyncDownloadList(entry.url)
+
+    -- Walk the whole tree; bounded so a pathological feed can't loop forever.
+    -- Downloads are capped separately by sync_max_dl below.
+    local results = {}
+    local walk_limit = 5000
+    self:walkFeedForBulk(server.url, {}, results, walk_limit)
+
+    local queued = 0
+    for _, r in ipairs(results) do
+        if queued >= self.sync_max_dl then break end
+
+        local skip = false
+        if file_list and not file_list[r.filetype] then
+            skip = true
+        end
+
+        if not skip then
+            local parts = { sync_dir }
+            for _, c in ipairs(r.breadcrumb) do
+                table.insert(parts, c)
             end
-            if #sub_table > 0 then
-                -- The first element seems to be most compatible. Second element has most options
-                item = sub_table[2]
-            else
-                item = entry
-            end
-            for j, link in ipairs(item.acquisitions) do
-                -- Only save first link in case of several file types
-                if i == 1 and j == 1 then
-                    new_last_download = link.href
-                end
-                local filetype = self.getFiletype(link)
-                if filetype then
-                    if not file_str or file_list and file_list[filetype] then
-                        local filename = self:getFileName(entry)
-                        local download_path = self:getLocalDownloadPath(server, filename, filetype, link.href)
-                        if dl_count <= self.sync_max_dl then -- Append only max_dl entries... may still have sync backlog
-                            table.insert(self.pending_syncs, {
-                                file = download_path,
-                                url = link.href,
-                                username = self.root_catalog_username,
-                                password = self.root_catalog_password,
-                                catalog = server.url,
-                            })
-                            dl_count = dl_count + 1
-                        end
-                        break
-                    end
+            local target_dir = table.concat(parts, "/"):gsub("//+", "/")
+            local dir_attr = lfs.attributes(target_dir)
+            if dir_attr and dir_attr.mode == "directory" then
+                local filename = self:getServerFileName(r.url, r.filetype)
+                filename = util.getSafeFilename(filename, target_dir)
+                local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
+                if not lfs.attributes(target_path) then
+                    table.insert(self.pending_syncs, {
+                        file     = target_path,
+                        url      = r.url,
+                        username = self.root_catalog_username,
+                        password = self.root_catalog_password,
+                        catalog  = server.url,
+                    })
+                    queued = queued + 1
                 end
             end
         end
     end
-    self.sync_server_list[server.url] = true
-    if new_last_download then
-        logger.dbg("Updating opds last download for server", server.title, "to", new_last_download)
-        self:updateFieldInCatalog(server, "last_download", new_last_download)
-    end
 
+    self.sync_server_list[server.url] = true
+    logger.info("Maki: queued", queued, "new file(s) from", server.title)
 end
 
 -- Get list of books to download bigger than sync_max_dl
