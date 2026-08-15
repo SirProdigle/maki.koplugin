@@ -6,10 +6,19 @@ local LuaSettings = require("luasettings")
 local OPDSBrowser = require("makibrowser")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local socket = require("socket")
 local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local logger = require("logger")
+
+-- Maki: after a reboot the WiFi interface comes up several seconds before the
+-- DNS resolver is usable. NetworkMgr:isOnline() is already true at that point,
+-- so a sync started then fails every queued file. Probe DNS and back off.
+local DNS_RETRY_DELAY = 30      -- seconds between readiness probes
+local DNS_MAX_RETRIES = 6       -- ~3 minutes of grace after connect
+-- Coalesce the duplicate NetworkConnected events KOReader emits on associate.
+local NETWORK_EVENT_DEBOUNCE = 10
 
 local OPDS = WidgetContainer:extend{
     name = "maki",
@@ -178,20 +187,54 @@ end
 
 function OPDS:_onNetworkConnected()
     logger.info("OPDS: Network connected, checking auto-sync")
-    if self.settings.sync_on_network then
-        UIManager:scheduleIn(0.5, function()
-            self:performAutoSync()
-        end)
+    if not self.settings.sync_on_network then return end
+    -- Maki: KOReader fires NetworkConnected more than once per association.
+    -- Without this, two syncs race each other on every boot.
+    local now = os.time()
+    if self.last_network_event and (now - self.last_network_event) < NETWORK_EVENT_DEBOUNCE then
+        logger.info("OPDS: Ignoring duplicate NetworkConnected event")
+        return
     end
+    self.last_network_event = now
+    self.dns_retries = 0
+    UIManager:scheduleIn(0.5, function()
+        self:performAutoSync()
+    end)
 end
 
 function OPDS:_onResume()
     logger.info("OPDS: Resumed, checking auto-sync")
     if self.settings.sync_on_resume then
+        self.dns_retries = 0
         UIManager:scheduleIn(2, function()
             self:performAutoSync()
         end)
     end
+end
+
+-- Maki: true if at least one sync-flagged server's hostname resolves. This is
+-- the check NetworkMgr:isOnline() doesn't do — the interface being up says
+-- nothing about whether the resolver has come back after a reboot.
+function OPDS:syncHostsResolve()
+    local checked = 0
+    for _, srv in ipairs(self.servers) do
+        if srv.sync and srv.url then
+            local host = srv.url:match("^https?://([^/:]+)")
+            if host then
+                checked = checked + 1
+                if socket.dns.toip(host) then return true end
+                logger.info("OPDS: DNS not ready for", host)
+            end
+        end
+    end
+    if checked > 0 then return false end
+    -- No sync host could be parsed — fall back to KOReader's generic probe
+    -- rather than blocking the sync outright.
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.canResolveHostnames then
+        return NetworkMgr:canResolveHostnames()
+    end
+    return true
 end
 
 function OPDS:schedulePeriodicSync()
@@ -236,6 +279,31 @@ function OPDS:performAutoSync()
         return
     end
 
+    -- Maki: isOnline() isn't enough right after a reboot — the resolver lags
+    -- the interface. Retry a few times before giving up quietly, rather than
+    -- starting a sync that will fail on every single file.
+    if not self:syncHostsResolve() then
+        self.dns_retries = (self.dns_retries or 0) + 1
+        -- A stable task reference, so a second trigger (resume + network
+        -- connect) replaces the pending retry instead of stacking a new chain.
+        self.dns_retry_task = self.dns_retry_task or function()
+            self:performAutoSync()
+        end
+        UIManager:unschedule(self.dns_retry_task)
+        if self.dns_retries <= DNS_MAX_RETRIES then
+            logger.info("OPDS: DNS not ready, retry", self.dns_retries, "of",
+                        DNS_MAX_RETRIES, "in", DNS_RETRY_DELAY, "s")
+            UIManager:scheduleIn(DNS_RETRY_DELAY, self.dns_retry_task)
+        else
+            logger.warn("OPDS: DNS still unavailable after", DNS_MAX_RETRIES,
+                        "retries, skipping auto-sync")
+            self.dns_retries = 0
+        end
+        return
+    end
+    if self.dns_retry_task then UIManager:unschedule(self.dns_retry_task) end
+    self.dns_retries = 0
+
     self.sync_in_progress = true
     logger.info("OPDS: Starting auto-sync")
 
@@ -275,6 +343,7 @@ end
 
 function OPDS:onCloseWidget()
     UIManager:unschedule(self.periodic_sync_task)
+    if self.dns_retry_task then UIManager:unschedule(self.dns_retry_task) end
     self:saveSettings()
 end
 

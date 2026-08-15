@@ -39,6 +39,26 @@ local CatalogCache = Cache:new{
     slots = 20,
 }
 
+-- Maki: decode percent-escapes (%20, %23, …) in a string.
+local function percent_decode(s)
+    if not s then return s end
+    return (s:gsub("%%(%x%x)", function(h)
+        return string.char(tonumber(h, 16))
+    end))
+end
+
+-- Maki: how many consecutive failures before we give up on a whole sync run.
+-- A dead network fails every single item instantly, so grinding through a
+-- 100-entry queue just stacks 100 error dialogs. Bail early instead.
+local SYNC_ABORT_AFTER_CONSECUTIVE_FAILURES = 2
+
+-- Maki: a queue entry that has failed this many times is dropped for good.
+local SYNC_MAX_ATTEMPTS = 3
+-- Maki: hard ceiling and age limit on the persisted queue, so a run of bad
+-- syncs can't grow settings/maki.lua without bound.
+local SYNC_QUEUE_MAX_ENTRIES = 500
+local SYNC_QUEUE_MAX_AGE = 7 * 24 * 3600
+
 -- Maki: sanitize a single path segment for filesystem use.
 -- Used by both the long-press bulk walker and the single-tap download path.
 local function sanitize_segment(name)
@@ -852,9 +872,7 @@ function OPDSBrowser:getServerFileName(item_url, filetype)
             -- email-header gymnastics needed.
             filename = disposition:match("filename%*=[^']*''([^;]+)")
             if filename then
-                filename = filename:gsub("%%(%x%x)", function(h)
-                    return string.char(tonumber(h, 16))
-                end)
+                filename = percent_decode(filename)
             else
                 -- Fall back to filename="..." or filename=...
                 filename = disposition:match('filename="([^"]+)"')
@@ -890,13 +908,15 @@ function OPDSBrowser:getServerFileName(item_url, filetype)
 
         -- If not found, try from redirect URL (location)
         if not filename and headers["location"] then
-            filename = headers["location"]:gsub(".*/", "")
+            filename = percent_decode(headers["location"]:gsub(".*/", ""))
         end
     end
 
-    -- If still no filename, extract from original URL (remove path and query params)
+    -- If still no filename, extract from original URL (remove path and query
+    -- params). Maki: the URL basename is percent-encoded — decode it, or a
+    -- failed HEAD request leaves names like "Unknown_%23%2091.cbz" on disk.
     if not filename then
-        filename = item_url:gsub(".*/", ""):gsub("?.*", "")
+        filename = percent_decode(item_url:gsub(".*/", ""):gsub("?.*", ""))
     end
 
     if filename and filetype then
@@ -1533,7 +1553,11 @@ function OPDSBrowser:checkDownloadFile(local_path, remote_url, username, passwor
     end
 end
 
-function OPDSBrowser:downloadFile(local_path, remote_url, username, password, caller_callback)
+-- Maki: `quiet` suppresses the per-file error dialog. Bulk/auto paths pass it
+-- and report one aggregate result instead — otherwise a dead network stacks
+-- one undismissable InfoMessage per queued file.
+-- Returns true on success, or false + a short reason on failure.
+function OPDSBrowser:downloadFile(local_path, remote_url, username, password, caller_callback, quiet)
     logger.dbg("Downloading file", local_path, "from", remote_url)
     local code, headers, status
     local parsed = url.parse(remote_url)
@@ -1550,9 +1574,12 @@ function OPDSBrowser:downloadFile(local_path, remote_url, username, password, ca
         })
         socketutil:reset_timeout()
     else
-        UIManager:show(InfoMessage:new {
-            text = T(_("Invalid protocol:\n%1"), parsed.scheme),
-        })
+        if not quiet then
+            UIManager:show(InfoMessage:new {
+                text = T(_("Invalid protocol:\n%1"), parsed.scheme),
+            })
+        end
+        return false, T(_("invalid protocol: %1"), tostring(parsed.scheme))
     end
     if code == 200 then
         logger.dbg("File downloaded to", local_path)
@@ -1562,19 +1589,25 @@ function OPDSBrowser:downloadFile(local_path, remote_url, username, password, ca
         return true
     elseif code == 302 and remote_url:match("^https") and headers.location:match("^http[^s]") then
         util.removeFile(local_path)
-        UIManager:show(InfoMessage:new{
-            text = T(_("Insecure HTTPS → HTTP downgrade attempted by redirect from:\n\n'%1'\n\nto\n\n'%2'.\n\nPlease inform the server administrator that many clients disallow this because it could be a downgrade attack."), BD.url(remote_url), BD.url(headers.location)),
-            icon = "notice-warning",
-        })
+        if not quiet then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Insecure HTTPS → HTTP downgrade attempted by redirect from:\n\n'%1'\n\nto\n\n'%2'.\n\nPlease inform the server administrator that many clients disallow this because it could be a downgrade attack."), BD.url(remote_url), BD.url(headers.location)),
+                icon = "notice-warning",
+            })
+        end
+        return false, _("insecure HTTPS → HTTP redirect")
     else
         util.removeFile(local_path)
-        logger.dbg("OPDSBrowser:downloadFile: Request failed:", status or code)
+        local reason = tostring(status or code or "network unreachable")
+        logger.dbg("OPDSBrowser:downloadFile: Request failed:", reason)
         logger.dbg("OPDSBrowser:downloadFile: Response headers:", headers)
-        UIManager:show(InfoMessage:new {
-            text = T(_("Could not save file to:\n%1\n%2"),
-                BD.filepath(local_path),
-                status or code or "network unreachable"),
-        })
+        if not quiet then
+            UIManager:show(InfoMessage:new {
+                text = T(_("Could not save file to:\n%1\n%2"),
+                    BD.filepath(local_path), reason),
+            })
+        end
+        return false, reason
     end
 end
 
@@ -1919,7 +1952,9 @@ function OPDSBrowser:downloadDownloadList()
     local completed, downloaded = Trapper:dismissableRunInSubprocess(function()
         local dl = {}
         for _, item in ipairs(self.downloads) do
-            if self:downloadFile(item.file, item.url, item.username, item.password) then
+            -- quiet: we're in a forked subprocess and there is a summary
+            -- below; per-file dialogs from here would stack unboundedly.
+            if self:downloadFile(item.file, item.url, item.username, item.password, nil, true) then
                 dl[item.file] = true
             end
         end
@@ -2128,6 +2163,60 @@ function OPDSBrowser:checkSyncDownload(idx, auto_sync)
     end)
 end
 
+-- Maki: keep the persisted download queue bounded and self-healing.
+-- Drops entries that already exist on disk, that have failed too often, that
+-- are older than SYNC_QUEUE_MAX_AGE, or that are duplicates of another entry.
+-- Finally trims to SYNC_QUEUE_MAX_ENTRIES (oldest first).
+function OPDSBrowser:prunePendingSyncs()
+    local list = self.pending_syncs
+    if not list or #list == 0 then return 0 end
+
+    local before = #list
+    local now = os.time()
+    local seen = {}
+    for j = #list, 1, -1 do
+        local item = list[j]
+        local drop = false
+        if not item or not item.file or not item.url then
+            drop = true
+        elseif seen[item.file] then
+            drop = true
+        elseif (item.fail_count or 0) >= SYNC_MAX_ATTEMPTS then
+            drop = true
+        elseif item.queued_at and (now - item.queued_at) > SYNC_QUEUE_MAX_AGE then
+            drop = true
+        elseif item.file:match("%%%x%x") then
+            -- Legacy entry queued before the filename decode fix: the target
+            -- name still carries raw percent-escapes ("Chapter%20230.cbz").
+            -- Drop it so the next scan re-queues it under the correct name.
+            drop = true
+        elseif lfs.attributes(item.file) and not self.sync_force then
+            drop = true -- already on disk, nothing to fetch
+        end
+        if drop then
+            table.remove(list, j)
+        else
+            -- Entries queued by older versions have no timestamp; stamp them
+            -- now so the age limit can actually apply to them.
+            item.queued_at = item.queued_at or now
+            seen[item.file] = true
+        end
+    end
+
+    -- Hard cap. Entries have no ordering guarantee beyond insertion, so trim
+    -- from the front (oldest queued).
+    while #list > SYNC_QUEUE_MAX_ENTRIES do
+        table.remove(list, 1)
+    end
+
+    local removed = before - #list
+    if removed > 0 then
+        logger.info("Maki: pruned", removed, "stale queue entries,", #list, "remain")
+        self._manager.updated = true
+    end
+    return removed
+end
+
 -- Maki: hierarchical, breadcrumb-aware fillPendingSyncs.
 --
 -- Walks the server's OPDS tree (navigation entries + acquisition entries +
@@ -2170,6 +2259,16 @@ function OPDSBrowser:fillPendingSyncs(server, on_scan_progress)
         end
     end
 
+    -- Maki: prune the persisted queue before adding to it — expire stale
+    -- entries and index what's already queued. Previously a rescan re-queued
+    -- every not-yet-downloaded file, so a run of failed syncs multiplied the
+    -- queue on every pass.
+    self:prunePendingSyncs()
+    local already_queued = {}
+    for _, q in ipairs(self.pending_syncs) do
+        already_queued[q.file] = true
+    end
+
     -- Walk the whole tree; bounded so a pathological feed can't loop forever.
     -- Downloads are capped separately by sync_max_dl below.
     local results = {}
@@ -2179,6 +2278,11 @@ function OPDSBrowser:fillPendingSyncs(server, on_scan_progress)
     local queued = 0
     for _, r in ipairs(results) do
         if queued >= self.sync_max_dl then break end
+        if #self.pending_syncs >= SYNC_QUEUE_MAX_ENTRIES then
+            logger.warn("Maki: pending_syncs hit the", SYNC_QUEUE_MAX_ENTRIES,
+                        "entry cap, stopping scan")
+            break
+        end
 
         local skip = false
         if file_list and not file_list[r.filetype] then
@@ -2196,13 +2300,15 @@ function OPDSBrowser:fillPendingSyncs(server, on_scan_progress)
                 local filename = self:getServerFileName(r.url, r.filetype)
                 filename = util.getSafeFilename(filename, target_dir)
                 local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
-                if not lfs.attributes(target_path) then
+                if not lfs.attributes(target_path) and not already_queued[target_path] then
+                    already_queued[target_path] = true
                     table.insert(self.pending_syncs, {
-                        file     = target_path,
-                        url      = r.url,
-                        username = self.root_catalog_username,
-                        password = self.root_catalog_password,
-                        catalog  = server.url,
+                        file      = target_path,
+                        url       = r.url,
+                        username  = self.root_catalog_username,
+                        password  = self.root_catalog_password,
+                        catalog   = server.url,
+                        queued_at = os.time(),
                     })
                     queued = queued + 1
                 end
@@ -2289,6 +2395,13 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
         local downloaded_set = {}
         local duplicate_list = {}
         local cancelled = false
+        -- Maki: a dead network fails every item instantly. Track consecutive
+        -- failures so we abort the run instead of grinding the whole queue,
+        -- and remember the first reason for a single aggregate report.
+        local consecutive_failures = 0
+        local failed_count = 0
+        local first_failure_reason
+        local aborted = false
 
         -- Keepalive HTTPS client cache, one per host. Most syncs hit a single
         -- server, so this collapses N TLS handshakes to one.
@@ -2317,14 +2430,32 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
                         if go == false then cancelled = true; break end
                     end
                     local ka = client_for(item)
-                    local ok = false
-                    if ka then ok = ka:downloadURL(item.url, item.file) end
+                    local ok, why = false, nil
+                    if ka then ok, why = ka:downloadURL(item.url, item.file) end
                     if ok == nil or ok == false then
                         -- Fall back to one-shot socket.http if keepalive client
                         -- isn't applicable (http://, host mismatch) or failed.
-                        ok = self:downloadFile(item.file, item.url, item.username, item.password)
+                        -- quiet=true: one aggregate report below, never one
+                        -- blocking dialog per queued file.
+                        ok, why = self:downloadFile(item.file, item.url, item.username, item.password, nil, true)
                     end
-                    if ok then downloaded_set[item.file] = true end
+                    if ok then
+                        downloaded_set[item.file] = true
+                        item.fail_count = nil
+                        consecutive_failures = 0
+                    else
+                        failed_count = failed_count + 1
+                        first_failure_reason = first_failure_reason or why
+                        item.fail_count = (item.fail_count or 0) + 1
+                        consecutive_failures = consecutive_failures + 1
+                        logger.warn("Maki: download failed", item.file, why)
+                        if consecutive_failures >= SYNC_ABORT_AFTER_CONSECUTIVE_FAILURES then
+                            logger.warn("Maki: aborting sync after", consecutive_failures,
+                                        "consecutive failures:", why)
+                            aborted = true
+                            break
+                        end
+                    end
                 end
             end
         end
@@ -2354,6 +2485,22 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
             end
         end
 
+        -- Maki: drop entries that have failed too many times. Without this a
+        -- permanently-unreachable file is retried on every sync, forever, and
+        -- the persisted queue only ever grows.
+        local expired = 0
+        for j = #dl_list, 1, -1 do
+            if (dl_list[j].fail_count or 0) >= SYNC_MAX_ATTEMPTS then
+                logger.warn("Maki: giving up on", dl_list[j].file, "after",
+                            dl_list[j].fail_count, "attempts")
+                table.remove(dl_list, j)
+                expired = expired + 1
+            end
+        end
+        if expired > 0 then
+            logger.info("Maki: dropped", expired, "permanently-failing queue entries")
+        end
+
         local duplicate_count = duplicate_list and #duplicate_list or 0
         dl_count = dl_count - duplicate_count
         if dl_count > 0 then
@@ -2362,6 +2509,22 @@ function OPDSBrowser:downloadPendingSyncs(auto_sync)
             })
             logger.info("Maki: download completed -", dl_count, "books")
         end
+
+        -- Maki: one aggregate failure report for the whole run, replacing the
+        -- per-file dialogs. Auto-sync stays silent (it runs unattended, often
+        -- right after boot when the network isn't up yet) and only logs.
+        if failed_count > 0 then
+            local msg = aborted
+                and T(_("Maki: sync stopped — the server could not be reached.\n%1\n%2 file(s) still queued."),
+                      tostring(first_failure_reason or "network error"), #dl_list)
+                or  T(_("Maki: %1 file(s) could not be downloaded.\n%2"),
+                      failed_count, tostring(first_failure_reason or "network error"))
+            logger.warn(msg)
+            if not auto_sync then
+                UIManager:show(InfoMessage:new{ text = msg, timeout = 5 })
+            end
+        end
+
         self._manager.updated = true
         return duplicate_list
     end
