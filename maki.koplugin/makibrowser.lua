@@ -14,6 +14,7 @@ local NetworkMgr = require("ui/network/manager")
 local DownloadMgr = require("ui/downloadmgr")
 local Notification = require("ui/widget/notification")
 local OPDSParser = require("makiparser")
+local Marker = require("makimarker")
 local OPDSPSE = require("makipse")
 local MakiHTTP = require("makihttp")
 local SpinWidget = require("ui/widget/spinwidget")
@@ -46,18 +47,6 @@ local function percent_decode(s)
         return string.char(tonumber(h, 16))
     end))
 end
-
--- Maki: how many consecutive failures before we give up on a whole sync run.
--- A dead network fails every single item instantly, so grinding through a
--- 100-entry queue just stacks 100 error dialogs. Bail early instead.
-local SYNC_ABORT_AFTER_CONSECUTIVE_FAILURES = 2
-
--- Maki: a queue entry that has failed this many times is dropped for good.
-local SYNC_MAX_ATTEMPTS = 3
--- Maki: hard ceiling and age limit on the persisted queue, so a run of bad
--- syncs can't grow settings/maki.lua without bound.
-local SYNC_QUEUE_MAX_ENTRIES = 500
-local SYNC_QUEUE_MAX_AGE = 7 * 24 * 3600
 
 -- Maki: sanitize a single path segment for filesystem use.
 -- Used by both the long-press bulk walker and the single-tap download path.
@@ -98,9 +87,6 @@ local OPDSBrowser = Menu:extend{
 }
 
 function OPDSBrowser:init()
-    -- Maki: the legacy sync queue is no longer owned by main.lua; keep the
-    -- field present so the old code paths can't index a nil.
-    self.pending_syncs = self.pending_syncs or {}
     self.item_table = self:genItemTableFromRoot()
     self.catalog_title = nil
     self.title_bar_left_icon = "appbar.menu"
@@ -157,8 +143,7 @@ function OPDSBrowser:showOPDSMenu()
                     callback = function()
                         UIManager:close(dialog)
                         NetworkMgr:runWhenConnected(function()
-                            self.sync_force = false
-                            self:checkSyncDownload()
+                            self._manager:launchSync{ manual = true }
                         end)
                     end,
                     align = "left",
@@ -168,8 +153,7 @@ function OPDSBrowser:showOPDSMenu()
                     callback = function()
                         UIManager:close(dialog)
                         NetworkMgr:runWhenConnected(function()
-                            self.sync_force = true
-                            self:checkSyncDownload()
+                            self._manager:launchSync{ manual = true, ignore_ledger = true }
                         end)
                     end,
                     align = "left",
@@ -1667,8 +1651,7 @@ function OPDSBrowser:onMenuHold(item)
                         callback = function()
                             UIManager:close(dialog)
                             NetworkMgr:runWhenConnected(function()
-                                self.sync_force = true
-                                self:checkSyncDownload(item.idx)
+                                self._manager:launchSync{ manual = true, server_index = item.idx - 1, ignore_ledger = true }
                             end)
                         end,
                     },
@@ -1677,8 +1660,7 @@ function OPDSBrowser:onMenuHold(item)
                         callback = function()
                             UIManager:close(dialog)
                             NetworkMgr:runWhenConnected(function()
-                                self.sync_force = false
-                                self:checkSyncDownload(item.idx)
+                                self._manager:launchSync{ manual = true, server_index = item.idx - 1 }
                             end)
                         end,
                     },
@@ -2080,524 +2062,6 @@ function OPDSBrowser:updateFieldInCatalog(item, name, value)
     self._manager.updated = true
 end
 
-function OPDSBrowser:checkSyncDownload(idx, auto_sync)
-    -- Maki: a single-server sync needs THAT server's sync_dir (or the global
-    -- fallback). A multi-server sync needs at least one sync-flagged server
-    -- to have a usable sync_dir. The upstream gate only checked the global
-    -- setting, which incorrectly blocked per-server sync configurations.
-    local function server_has_dir(srv)
-        return srv and (srv.sync_dir or self.settings.sync_dir)
-    end
-
-    local can_sync = false
-    if idx then
-        can_sync = server_has_dir(self.servers[idx-1])
-    else
-        for _, srv in ipairs(self.servers) do
-            if srv.sync and server_has_dir(srv) then
-                can_sync = true
-                break
-            end
-        end
-    end
-
-    if not can_sync then
-        logger.info("Maki: no syncable server (idx=" .. tostring(idx) .. ")")
-        if not auto_sync then
-            UIManager:show(InfoMessage:new{
-                text = _("No sync folder configured for this catalog. Long-press the catalog → Edit → Set sync folder."),
-            })
-        end
-        return
-    end
-
-    logger.info("Maki: starting sync, idx=" .. tostring(idx))
-    self.sync = true
-
-    -- Wrap the entire sync (scan + download) in one Trapper coroutine so
-    -- Trapper:info can drive a single live progress widget through both
-    -- phases — both for manual sync and auto-sync.
-    Trapper:wrap(function()
-        local progress_cb
-        if not auto_sync then
-            local last_label
-            progress_cb = function(count, where)
-                if where ~= last_label or count % 25 == 0 then
-                    last_label = where
-                    return Trapper:info(T(_("Scanning: %1\n%2 file(s) found"), where, count))
-                end
-                return true
-            end
-            Trapper:info(_("Scanning catalog…"))
-        end
-
-        if idx then
-            self:fillPendingSyncs(self.servers[idx-1], progress_cb)
-        else
-            for _, item in ipairs(self.servers) do
-                if item.sync then
-                    self:fillPendingSyncs(item, progress_cb)
-                end
-            end
-        end
-
-        if #self.pending_syncs > 0 then
-            logger.info("Maki: queued", #self.pending_syncs, "downloads")
-            local success, err = pcall(function()
-                self:downloadPendingSyncs(auto_sync)
-            end)
-            if not success then
-                logger.err("Maki: download failed:", err)
-            end
-        else
-            if not auto_sync then
-                Trapper:reset()
-                UIManager:show(InfoMessage:new{ text = _("Up to date!") })
-            end
-            logger.info("Maki: nothing new to sync")
-        end
-
-        self.settings.last_sync_time = os.time()
-        self._manager.updated = true
-        self._manager:saveSettings()
-        if not auto_sync then Trapper:reset() end
-        self.sync = false
-        logger.info("Maki: sync done")
-    end)
-end
-
--- Maki: keep the persisted download queue bounded and self-healing.
--- Drops entries that already exist on disk, that have failed too often, that
--- are older than SYNC_QUEUE_MAX_AGE, or that are duplicates of another entry.
--- Finally trims to SYNC_QUEUE_MAX_ENTRIES (oldest first).
-function OPDSBrowser:prunePendingSyncs()
-    local list = self.pending_syncs
-    if not list or #list == 0 then return 0 end
-
-    local before = #list
-    local now = os.time()
-    local seen = {}
-    for j = #list, 1, -1 do
-        local item = list[j]
-        local drop = false
-        if not item or not item.file or not item.url then
-            drop = true
-        elseif seen[item.file] then
-            drop = true
-        elseif (item.fail_count or 0) >= SYNC_MAX_ATTEMPTS then
-            drop = true
-        elseif item.queued_at and (now - item.queued_at) > SYNC_QUEUE_MAX_AGE then
-            drop = true
-        elseif item.file:match("%%%x%x") then
-            -- Legacy entry queued before the filename decode fix: the target
-            -- name still carries raw percent-escapes ("Chapter%20230.cbz").
-            -- Drop it so the next scan re-queues it under the correct name.
-            drop = true
-        elseif lfs.attributes(item.file) and not self.sync_force then
-            drop = true -- already on disk, nothing to fetch
-        end
-        if drop then
-            table.remove(list, j)
-        else
-            -- Entries queued by older versions have no timestamp; stamp them
-            -- now so the age limit can actually apply to them.
-            item.queued_at = item.queued_at or now
-            seen[item.file] = true
-        end
-    end
-
-    -- Hard cap. Entries have no ordering guarantee beyond insertion, so trim
-    -- from the front (oldest queued).
-    while #list > SYNC_QUEUE_MAX_ENTRIES do
-        table.remove(list, 1)
-    end
-
-    local removed = before - #list
-    if removed > 0 then
-        logger.info("Maki: pruned", removed, "stale queue entries,", #list, "remain")
-        self._manager.updated = true
-    end
-    return removed
-end
-
--- Maki: hierarchical, breadcrumb-aware fillPendingSyncs.
---
--- Walks the server's OPDS tree (navigation entries + acquisition entries +
--- rel=next pagination), builds target paths that preserve folder structure
--- (<sync_dir>/<series>/<file>.ext), and queues acquisitions that are
--- (a) destined for a folder that already exists on disk, and
--- (b) not already on disk themselves.
---
--- "Existing folder only" is intentional — it means new chapters arrive in
--- series the user has already pulled, but brand-new series don't auto-spawn
--- on the device. To start syncing a new series, do one manual long-press
--- "Download all here" to create the folder; subsequent runs will keep it
--- up to date.
---
--- This replaces the upstream flat, cursor-based logic. The cursor was a
--- perf optimization for big flat catalogs (e.g. Project Gutenberg); for
--- the hierarchical server-library case this isn't needed and the file
--- system is the source of truth instead.
-function OPDSBrowser:fillPendingSyncs(server, on_scan_progress)
-    self.root_catalog_password  = server.password
-    self.root_catalog_raw_names = server.raw_names
-    self.root_catalog_username  = server.username
-    self.root_catalog_title     = server.title
-    self.sync_server            = server
-    self.sync_server_list       = self.sync_server_list or {}
-    self.sync_max_dl            = self.settings.sync_max_dl or 50
-
-    local sync_dir = server.sync_dir or self.settings.sync_dir
-    if not sync_dir or sync_dir == "" then
-        logger.warn("Maki: server", server.title, "has no sync_dir, skipping")
-        return
-    end
-
-    local file_list
-    local file_str = self.settings.filetypes
-    if file_str then
-        file_list = {}
-        for filetype in util.gsplit(file_str, ",") do
-            file_list[util.trim(filetype)] = true
-        end
-    end
-
-    -- Maki: prune the persisted queue before adding to it — expire stale
-    -- entries and index what's already queued. Previously a rescan re-queued
-    -- every not-yet-downloaded file, so a run of failed syncs multiplied the
-    -- queue on every pass.
-    self:prunePendingSyncs()
-    local already_queued = {}
-    for _, q in ipairs(self.pending_syncs) do
-        already_queued[q.file] = true
-    end
-
-    -- Walk the whole tree; bounded so a pathological feed can't loop forever.
-    -- Downloads are capped separately by sync_max_dl below.
-    local results = {}
-    local walk_limit = 5000
-    self:walkFeedForBulk(server.url, {}, results, walk_limit, on_scan_progress)
-
-    local queued = 0
-    for _, r in ipairs(results) do
-        if queued >= self.sync_max_dl then break end
-        if #self.pending_syncs >= SYNC_QUEUE_MAX_ENTRIES then
-            logger.warn("Maki: pending_syncs hit the", SYNC_QUEUE_MAX_ENTRIES,
-                        "entry cap, stopping scan")
-            break
-        end
-
-        local skip = false
-        if file_list and not file_list[r.filetype] then
-            skip = true
-        end
-
-        if not skip then
-            local parts = { sync_dir }
-            for _, c in ipairs(r.breadcrumb) do
-                table.insert(parts, c)
-            end
-            local target_dir = table.concat(parts, "/"):gsub("//+", "/")
-            local dir_attr = lfs.attributes(target_dir)
-            if dir_attr and dir_attr.mode == "directory" then
-                local filename = self:getServerFileName(r.url, r.filetype)
-                filename = util.getSafeFilename(filename, target_dir)
-                local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
-                if not lfs.attributes(target_path) and not already_queued[target_path] then
-                    already_queued[target_path] = true
-                    table.insert(self.pending_syncs, {
-                        file      = target_path,
-                        url       = r.url,
-                        username  = self.root_catalog_username,
-                        password  = self.root_catalog_password,
-                        catalog   = server.url,
-                        queued_at = os.time(),
-                    })
-                    queued = queued + 1
-                end
-            end
-        end
-    end
-
-    self.sync_server_list[server.url] = true
-    logger.info("Maki: queued", queued, "new file(s) from", server.title)
-end
-
--- Get list of books to download bigger than sync_max_dl
-function OPDSBrowser:getSyncDownloadList(url_arg)
-    local sync_table = {}
-    local fetch_url = url_arg or self.sync_server.url
-    local sub_table
-    local up_to_date = false
-    while #sync_table < self.sync_max_dl and not up_to_date do
-        sub_table = self:genItemTableFromURL(fetch_url)
-        -- timeout
-        if #sub_table == 0 then
-            return sync_table
-        end
-        local count = 1
-        local acquisitions_empty = false
-        -- For project gutenberg
-        while #sub_table[count].acquisitions == 0 do
-            if util.stringEndsWith(sub_table[count].url, ".opds") then
-                acquisitions_empty = true
-                break
-            end
-            if count == #sub_table then
-                return sync_table
-            end
-            count = count + 1
-        end
-        -- First entry in table is the newest
-        -- If already downloaded, return
-        local first_href
-        if acquisitions_empty then
-            first_href = sub_table[count].url
-        else
-            first_href = sub_table[1].acquisitions[1].href
-        end
-        if first_href == self.sync_server.last_download and not self.sync_force then
-            return nil
-        end
-        local href
-        for i, entry in ipairs(sub_table) do
-            if acquisitions_empty then
-                if i >= count then
-                    href = entry.url
-                else
-                    href = nil
-                end
-            else
-                href = entry.acquisitions[1].href
-            end
-            if href then
-                if href == self.sync_server.last_download and not self.sync_force then
-                    up_to_date = true
-                    break
-                else
-                    table.insert(sync_table, entry)
-                end
-            end
-        end
-        if not sub_table.hrefs.next then
-            break
-        end
-        fetch_url = sub_table.hrefs.next
-    end
-    return sync_table
-end
-
--- Download pending syncs list. Must be called inside Trapper:wrap.
--- For manual sync, drives a live "Downloading i / N" widget via Trapper:info
--- (tap to cancel). For auto-sync, runs silently without UI updates.
-function OPDSBrowser:downloadPendingSyncs(auto_sync)
-    local dl_list = self.pending_syncs
-
-    local function dismissable_download()
-        local total = #dl_list
-        local downloaded_set = {}
-        local duplicate_list = {}
-        local cancelled = false
-        -- Maki: a dead network fails every item instantly. Track consecutive
-        -- failures so we abort the run instead of grinding the whole queue,
-        -- and remember the first reason for a single aggregate report.
-        local consecutive_failures = 0
-        local failed_count = 0
-        local first_failure_reason
-        local aborted = false
-
-        -- Keepalive HTTPS client cache, one per host. Most syncs hit a single
-        -- server, so this collapses N TLS handshakes to one.
-        local clients = {}
-        local function client_for(item)
-            local base = item.url and item.url:match("^(https://[^/]+)") or nil
-            if not base then return nil end
-            if not clients[base] then
-                clients[base] = MakiHTTP.Client:new{
-                    base_url = base,
-                    username = item.username,
-                    password = item.password,
-                }
-            end
-            return clients[base]
-        end
-
-        for i, item in ipairs(dl_list) do
-            if self.sync_server_list[item.catalog] then
-                if lfs.attributes(item.file) and not self.sync_force then
-                    table.insert(duplicate_list, item)
-                else
-                    if not auto_sync then
-                        local short = item.file:match("[^/]+$") or item.file
-                        local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
-                        if go == false then cancelled = true; break end
-                    end
-                    local ka = client_for(item)
-                    local ok, why = false, nil
-                    if ka then ok, why = ka:downloadURL(item.url, item.file) end
-                    if ok == nil or ok == false then
-                        -- Fall back to one-shot socket.http if keepalive client
-                        -- isn't applicable (http://, host mismatch) or failed.
-                        -- quiet=true: one aggregate report below, never one
-                        -- blocking dialog per queued file.
-                        ok, why = self:downloadFile(item.file, item.url, item.username, item.password, nil, true)
-                    end
-                    if ok then
-                        downloaded_set[item.file] = true
-                        item.fail_count = nil
-                        consecutive_failures = 0
-                    else
-                        failed_count = failed_count + 1
-                        first_failure_reason = first_failure_reason or why
-                        item.fail_count = (item.fail_count or 0) + 1
-                        consecutive_failures = consecutive_failures + 1
-                        logger.warn("Maki: download failed", item.file, why)
-                        if consecutive_failures >= SYNC_ABORT_AFTER_CONSECUTIVE_FAILURES then
-                            logger.warn("Maki: aborting sync after", consecutive_failures,
-                                        "consecutive failures:", why)
-                            aborted = true
-                            break
-                        end
-                    end
-                end
-            end
-        end
-
-        for _, c in pairs(clients) do c:close() end
-        if not auto_sync then Trapper:reset() end
-
-        local dl_count = 0
-        for j = #dl_list, 1, -1 do
-            local item = dl_list[j]
-            if downloaded_set[item.file] then
-                dl_count = dl_count + 1
-                table.remove(dl_list, j)
-            elseif cancelled then
-                -- File may have been partially written before we broke out.
-                local attr = lfs.attributes(item.file)
-                if attr then
-                    if attr.size > 0 then
-                        table.remove(dl_list, j)
-                        if attr.modification > os.time() - 300 then
-                            dl_count = dl_count + 1
-                        end
-                    else
-                        os.remove(item.file)
-                    end
-                end
-            end
-        end
-
-        -- Maki: drop entries that have failed too many times. Without this a
-        -- permanently-unreachable file is retried on every sync, forever, and
-        -- the persisted queue only ever grows.
-        local expired = 0
-        for j = #dl_list, 1, -1 do
-            if (dl_list[j].fail_count or 0) >= SYNC_MAX_ATTEMPTS then
-                logger.warn("Maki: giving up on", dl_list[j].file, "after",
-                            dl_list[j].fail_count, "attempts")
-                table.remove(dl_list, j)
-                expired = expired + 1
-            end
-        end
-        if expired > 0 then
-            logger.info("Maki: dropped", expired, "permanently-failing queue entries")
-        end
-
-        local duplicate_count = duplicate_list and #duplicate_list or 0
-        dl_count = dl_count - duplicate_count
-        if dl_count > 0 then
-            UIManager:show(Notification:new{
-                text = T(N_("1 book downloaded", "%1 books downloaded", dl_count), dl_count)
-            })
-            logger.info("Maki: download completed -", dl_count, "books")
-        end
-
-        -- Maki: one aggregate failure report for the whole run, replacing the
-        -- per-file dialogs. Auto-sync stays silent (it runs unattended, often
-        -- right after boot when the network isn't up yet) and only logs.
-        if failed_count > 0 then
-            local msg = aborted
-                and T(_("Maki: sync stopped — the server could not be reached.\n%1\n%2 file(s) still queued."),
-                      tostring(first_failure_reason or "network error"), #dl_list)
-                or  T(_("Maki: %1 file(s) could not be downloaded.\n%2"),
-                      failed_count, tostring(first_failure_reason or "network error"))
-            logger.warn(msg)
-            if not auto_sync then
-                UIManager:show(InfoMessage:new{ text = msg, timeout = 5 })
-            end
-        end
-
-        self._manager.updated = true
-        return duplicate_list
-    end
-
-    local duplicate_list = dismissable_download()
-
-    if duplicate_list and #duplicate_list > 0 then
-        if auto_sync then
-            logger.info("OPDS: Auto-sync - skipping", #duplicate_list, "duplicate files")
-        else
-            local textviewer
-            local duplicate_files = { _("These files are already on the device:") }
-            for _, entry in ipairs(duplicate_list) do
-                table.insert(duplicate_files, entry.file)
-            end
-            local text = table.concat(duplicate_files, "\n")
-            textviewer = TextViewer:new{
-                title = _("Duplicate files"),
-                text = text,
-                buttons_table = {
-                    {
-                        {
-                            text = _("Do nothing"),
-                            callback = function()
-                                textviewer:onClose()
-                            end
-                        },
-                        {
-                            text = _("Overwrite"),
-                            callback = function()
-                                self.sync_force = true
-                                textviewer:onClose()
-                                for _, entry in ipairs(duplicate_list) do
-                                    table.insert(dl_list, entry)
-                                end
-                                Trapper:wrap(function()
-                                    dismissable_download()
-                                end)
-                            end
-                        },
-                        {
-                            text = _("Download copies"),
-                            callback = function()
-                                self.sync_force = true
-                                textviewer:onClose()
-                                local copy_download_dir, original_dir, copies_dir, copy_download_path
-                                copies_dir = "copies"
-                                original_dir = util.splitFilePathName(duplicate_list[1].file)
-                                copy_download_dir = original_dir .. copies_dir .. "/"
-                                util.makePath(copy_download_dir)
-                                for _, entry in ipairs(duplicate_list) do
-                                    local _, file_name = util.splitFilePathName(entry.file)
-                                    copy_download_path = copy_download_dir .. file_name
-                                    entry.file = copy_download_path
-                                    table.insert(dl_list, entry)
-                                end
-                                Trapper:wrap(function()
-                                    dismissable_download()
-                                end)
-                            end
-                        },
-                    },
-                },
-            }
-            UIManager:show(textviewer)
-        end
-    end
-    logger.info("OPDS: downloadPendingSyncs fully completed")
-end
-
 -- ─── Maki: bulk download with breadcrumb-based folder structure ─────────────
 
 -- Find the currently-entered root server config by title.
@@ -2612,7 +2076,8 @@ end
 -- Recursively walk an OPDS feed, collecting downloadable acquisitions plus the
 -- breadcrumb (folder names) that describe where each one should go on disk.
 -- Stops walking once `limit` items have been collected.
-function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_progress)
+function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_progress, feed_root)
+    feed_root = feed_root or item_url
     if #results >= limit or results._cancelled then return end
 
     -- Tell the caller what we're about to scan. on_progress can return false
@@ -2639,6 +2104,7 @@ function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_pr
                             title      = item.title or item.text or "Untitled",
                             filetype   = filetype,
                             breadcrumb = breadcrumb,
+                            feed       = feed_root,
                         })
                         break
                     end
@@ -2650,12 +2116,12 @@ function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_pr
             local new_crumb = {}
             for _, c in ipairs(breadcrumb) do table.insert(new_crumb, c) end
             table.insert(new_crumb, sanitize_segment(item.title or item.text))
-            self:walkFeedForBulk(item.url, new_crumb, results, limit, on_progress)
+            self:walkFeedForBulk(item.url, new_crumb, results, limit, on_progress, item.url)
         end
     end
     -- Follow rel=next pagination for the same level.
     if item_table.hrefs and item_table.hrefs.next and #results < limit and not results._cancelled then
-        self:walkFeedForBulk(item_table.hrefs.next, breadcrumb, results, limit, on_progress)
+        self:walkFeedForBulk(item_table.hrefs.next, breadcrumb, results, limit, on_progress, feed_root)
     end
 end
 
@@ -2731,6 +2197,8 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
             url      = r.url,
             file     = target_path,
             dir      = target_dir,
+            feed     = r.feed,
+            title    = r.breadcrumb[#r.breadcrumb],
             username = self.root_catalog_username,
             password = self.root_catalog_password,
         })
@@ -2775,6 +2243,35 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
         end
     end
     if ka then ka:close() end
+
+    -- Record what this series folder now holds so auto-sync can follow it.
+    local server = self:getCurrentServer()
+    if server then
+        local now = os.time()
+        local by_dir = {}
+        for _, p in ipairs(plan) do
+            if lfs.attributes(p.file) then
+                local b = by_dir[p.dir]
+                if not b then
+                    b = { feed = p.feed, title = p.title, items = {} }
+                    by_dir[p.dir] = b
+                end
+                b.items[#b.items + 1] = p
+            end
+        end
+        for dir, b in pairs(by_dir) do
+            local marker = Marker.read(dir) or { fetched = {} }
+            marker.catalog = server.url
+            marker.feed = b.feed
+            marker.title = marker.title or b.title
+            for _, p in ipairs(b.items) do
+                Marker.markFetched(marker, p.url, p.file:match("[^/]+$"), now)
+            end
+            local ok, err = Marker.write(dir, marker)
+            if not ok then logger.warn("Maki: marker write failed", dir, err) end
+        end
+    end
+
     Trapper:reset()
 
     UIManager:show(InfoMessage:new{
