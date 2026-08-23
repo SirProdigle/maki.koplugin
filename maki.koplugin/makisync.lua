@@ -90,7 +90,7 @@ local function collect_entries(feed_url, deps)
     return entries
 end
 
-local function sync_one_series(server, followed, settings, deps, opts, result, state)
+local function sync_one_series(server, followed, deps, opts, result, state)
     local marker, dir = followed.marker, followed.dir
     local rec = { title = marker.title or dir:match("[^/]+$"), dir = dir,
                   downloaded = 0, failed = 0, adopted = 0, feed_failed = false }
@@ -180,7 +180,7 @@ function M.runSync(servers, settings, deps, opts)
     for i, t in ipairs(targets) do
         state.series_index = i
         if deps.useServer then deps.useServer(t.server) end
-        sync_one_series(t.server, t.followed, settings, deps, opts, result, state)
+        sync_one_series(t.server, t.followed, deps, opts, result, state)
         if result.aborted or result.cancelled then break end
         if result.capped then break end
     end

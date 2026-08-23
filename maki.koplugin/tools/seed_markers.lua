@@ -35,7 +35,7 @@ local function fetch_all(browser, url)
         local ok, catalog = pcall(browser.parseFeed, browser, page)
         if not ok or not catalog then return nil end
         local tbl = browser:genItemTableFromCatalog(catalog, page)
-        for _ignore, it in ipairs(tbl) do
+        for _, it in ipairs(tbl) do
             items[#items + 1] = it
             if it.acquisitions and it.acquisitions[1] then has_acq = true end
         end
@@ -50,7 +50,7 @@ local function walk(browser, url, on_series, depth, progress)
     local items, has_acq = fetch_all(browser, url)
     if not items then return end
     if has_acq then return end -- caller handles series feeds
-    for _ignore, it in ipairs(items) do
+    for _, it in ipairs(items) do
         if it.url and not (it.acquisitions and it.acquisitions[1]) then
             if progress and progress(it.title or it.text or "") == false then return end
             local sub, sub_acq = fetch_all(browser, it.url)
@@ -68,7 +68,7 @@ function M.run(plugin)
     Trapper:wrap(function()
         local matched, unmatched, skipped = {}, {}, {}
         local now = os.time()
-        for _ignore, srv in ipairs(plugin.servers) do
+        for _, srv in ipairs(plugin.servers) do
             local sync_dir = srv.sync_dir or plugin.settings.sync_dir
             if srv.sync and sync_dir then
                 browser.root_catalog_username = srv.username
@@ -89,13 +89,13 @@ function M.run(plugin)
                     seen[folder] = true
                     if has_marker(dir) then skipped[#skipped + 1] = folder; return end
                     local marker = { catalog = srv.url, feed = feed_url, title = title, fetched = {} }
-                    for _i, it in ipairs(items) do
+                    for _, it in ipairs(items) do
                         -- Pick the same link makisync would: the first
                         -- non-borrow acquisition with a known filetype.
                         -- acquisitions[1] is not always it (Komga lists a
                         -- borrow link first for some entries), and a baseline
                         -- keyed by the wrong URL would not suppress anything.
-                        for _j, a in ipairs(it.acquisitions or {}) do
+                        for _, a in ipairs(it.acquisitions or {}) do
                             if a.href and a.type ~= "borrow" and OPDSBrowser.getFiletype(a) then
                                 marker.fetched[a.href] = { at = now }
                                 break

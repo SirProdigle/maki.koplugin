@@ -66,7 +66,7 @@ function M.read(dir, deps)
     if not ok_read or not contents then
         return { fetched = {} }
     end
-    local loader = load or loadstring
+    local loader = load or rawget(_G, "loadstring")
     local chunk, load_err = loader(contents, "@" .. path)
     if not chunk then
         logger.warn("Maki: failed to parse marker", path, load_err)
