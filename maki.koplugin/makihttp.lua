@@ -265,6 +265,70 @@ function Client:download(path, out_path)
     return true
 end
 
+-- HEAD request over the keepalive connection. Returns the response header
+-- table (lowercased keys, plus _code) for any HTTP response, or nil + err on
+-- transport failure. HEAD responses carry no body regardless of
+-- Content-Length, so nothing needs draining before the next request.
+function Client:head(path)
+    if not self.sock then
+        local ok, err = self:_connect()
+        if not ok then return nil, err end
+    end
+    local req_lines = {
+        "HEAD " .. path .. " HTTP/1.1",
+        "Host: " .. self.host,
+        "User-Agent: " .. self.user_agent,
+        "Accept: */*",
+        "Connection: keep-alive",
+    }
+    if self.auth_header then
+        table.insert(req_lines, "Authorization: " .. self.auth_header)
+    end
+    local req = table.concat(req_lines, "\r\n") .. "\r\n\r\n"
+    local _, send_err = self.sock:send(req)
+    if send_err then
+        -- Stale half-closed connection: reopen and retry once.
+        self:close()
+        local rok, rerr = self:_connect()
+        if not rok then return nil, "reconnect: " .. tostring(rerr) end
+        local _, send_err2 = self.sock:send(req)
+        if send_err2 then return nil, "send: " .. tostring(send_err2) end
+    end
+    local status_line, sl_err = recv_line(self.sock)
+    if not status_line then
+        self:close()
+        return nil, "no status: " .. tostring(sl_err)
+    end
+    local code = tonumber(status_line:match("HTTP/1%.[01]%s+(%d+)"))
+    if not code then
+        self:close()
+        return nil, "bad status: " .. status_line
+    end
+    local headers, herr = recv_headers(self.sock)
+    if not headers then
+        self:close()
+        return nil, "headers: " .. tostring(herr)
+    end
+    if headers["connection"] and headers["connection"]:lower() == "close" then
+        self:close()
+    end
+    headers._code = code
+    return headers
+end
+
+-- Convenience: HEAD an absolute URL through this client iff the host
+-- matches; returns nil if it doesn't (caller should fall back).
+function Client:headURL(absolute_url)
+    local p = socket_url.parse(absolute_url or "")
+    if p.scheme ~= "https" or p.host ~= self.host
+       or (tonumber(p.port) or 443) ~= self.port then
+        return nil, "host mismatch"
+    end
+    local path = p.path or "/"
+    if p.query and p.query ~= "" then path = path .. "?" .. p.query end
+    return self:head(path)
+end
+
 -- Convenience: download an absolute URL through this client iff the host
 -- matches; returns nil if it doesn't (caller should fall back).
 function Client:downloadURL(absolute_url, out_path)

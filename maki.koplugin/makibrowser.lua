@@ -17,6 +17,7 @@ local OPDSParser = require("makiparser")
 local Marker = require("makimarker")
 local OPDSPSE = require("makipse")
 local MakiHTTP = require("makihttp")
+local MakiNames = require("makinames")
 local SpinWidget = require("ui/widget/spinwidget")
 local TextViewer = require("ui/widget/textviewer")
 local Trapper = require("ui/trapper")
@@ -861,8 +862,12 @@ function OPDSBrowser:parseFeed(item_url)
     end
 end
 
-function OPDSBrowser:getServerFileName(item_url, filetype)
-    local headers = self:fetchFeed(item_url, true)
+-- Derive the on-disk filename from a response's headers (Content-Disposition
+-- in its various encodings, redirect Location, URL basename fallback), then
+-- normalise manga chapter names via makinames. Split out of getServerFileName
+-- so the bulk downloader can feed it headers obtained over its keepalive
+-- connection instead of paying a fresh TLS handshake per HEAD.
+function OPDSBrowser.fileNameFromHeaders(headers, item_url, filetype)
     local filename
 
     if headers then
@@ -931,7 +936,12 @@ function OPDSBrowser:getServerFileName(item_url, filetype)
         end
     end
 
-    return filename
+    return MakiNames.normalizeChapter(filename)
+end
+
+function OPDSBrowser:getServerFileName(item_url, filetype)
+    local headers = self:fetchFeed(item_url, true)
+    return OPDSBrowser.fileNameFromHeaders(headers, item_url, filetype)
 end
 
 -- Generates link to search in catalog
@@ -2123,6 +2133,15 @@ function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_pr
                             breadcrumb = breadcrumb,
                             feed       = feed_root,
                         })
+                        -- Tick the counter as items are collected, not just
+                        -- once per feed page — otherwise a single-series
+                        -- download sits on "0 file(s) found" for the whole
+                        -- scan.
+                        if on_progress then
+                            local go = on_progress(#results,
+                                breadcrumb[#breadcrumb] or self.root_catalog_title or "catalog")
+                            if go == false then results._cancelled = true; return end
+                        end
                         break
                     end
                 end
@@ -2179,10 +2198,13 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
     -- Scan phase. Trapper:info updates as we descend into each subfeed.
     Trapper:info(_("Scanning catalog…"))
     local results = {}
-    local last_label
+    local last_label, last_painted = nil, -1
     local function scan_progress(count, where)
-        if where ~= last_label or count % 25 == 0 then
+        -- Repaint on folder change, for the first few files (instant
+        -- feedback), then every 10 — e-ink repaints per item would be churn.
+        if where ~= last_label or count <= 2 or count - last_painted >= 10 then
             last_label = where
+            last_painted = count
             return Trapper:info(T(_("Scanning: %1\n%2 file(s) found"), where, count))
         end
         return true
@@ -2199,15 +2221,36 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
         return
     end
 
-    -- Plan target paths.
+    -- Plan target paths. Learning each file's server-side name takes one
+    -- HEAD request per file; run them over the same keepalive connection the
+    -- downloads will use (one TLS handshake total instead of one per file)
+    -- and narrate progress — this silent stretch was the old "0 file(s)
+    -- found" hang, and on a slow radio it could run into the socket timeout.
+    local ka = MakiHTTP.Client:new{
+        base_url = results[1].url:match("^(https://[^/]+)") or "",
+        username = self.root_catalog_username,
+        password = self.root_catalog_password,
+    }
     local plan = {}
-    for _, r in ipairs(results) do
+    for idx, r in ipairs(results) do
+        local go = Trapper:info(T(_("Preparing %1 / %2\n%3"), idx, #results, r.title or ""))
+        if go == false then
+            if ka then ka:close() end
+            Trapper:reset()
+            return
+        end
         local parts = { base_dir }
         for _, c in ipairs(r.breadcrumb) do
             table.insert(parts, c)
         end
         local target_dir = table.concat(parts, "/"):gsub("//+", "/")
-        local filename = self:getServerFileName(r.url, r.filetype)
+        local filename
+        local headers = ka and ka:headURL(r.url)
+        if headers then
+            filename = OPDSBrowser.fileNameFromHeaders(headers, r.url, r.filetype)
+        else
+            filename = self:getServerFileName(r.url, r.filetype)
+        end
         filename = util.getSafeFilename(filename, target_dir)
         local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
         table.insert(plan, {
@@ -2228,11 +2271,6 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
     -- Kindle radio does).
     local total = #plan
     local downloaded, skipped, failed = 0, 0, 0
-    local ka = MakiHTTP.Client:new{
-        base_url = plan[1] and plan[1].url:match("^(https://[^/]+)") or "",
-        username = self.root_catalog_username,
-        password = self.root_catalog_password,
-    }
     for i, p in ipairs(plan) do
         local short = p.file:match("[^/]+$") or p.file
         local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
