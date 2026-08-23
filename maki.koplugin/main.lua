@@ -11,6 +11,12 @@ local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local logger = require("logger")
+local ffiutil = require("ffi/util")
+local InfoMessage = require("ui/widget/infomessage")
+local Notification = require("ui/widget/notification")
+local dump = require("dump")
+local MakiSync = require("makisync")
+local lfs = require("libs/libkoreader-lfs")
 
 -- Maki: after a reboot the WiFi interface comes up several seconds before the
 -- DNS resolver is usable. NetworkMgr:isOnline() is already true at that point,
@@ -19,6 +25,8 @@ local DNS_RETRY_DELAY = 30      -- seconds between readiness probes
 local DNS_MAX_RETRIES = 6       -- ~3 minutes of grace after connect
 -- Coalesce the duplicate NetworkConnected events KOReader emits on associate.
 local NETWORK_EVENT_DEBOUNCE = 10
+-- How often the parent checks on the forked sync child.
+local SYNC_POLL_SECONDS = 2
 
 local OPDS = WidgetContainer:extend{
     name = "maki",
@@ -84,8 +92,6 @@ function OPDS:init()
             self.updated = true
         end
     end
-    self.pending_syncs = self.opds_settings:readSetting("pending_syncs", {})
-    self.sync_in_progress = false
 
     -- Initialize auto-sync
     self:initAutoSync()
@@ -116,7 +122,6 @@ function OPDS:onShowMakiCatalog()
         servers = self.servers,
         downloads = self.downloads,
         settings = self.settings,
-        pending_syncs = self.pending_syncs,
         title = _("OPDS catalog"),
         is_popout = false,
         is_borderless = true,
@@ -245,7 +250,7 @@ function OPDS:schedulePeriodicSync()
 end
 
 function OPDS:performAutoSync()
-    if self.sync_in_progress then
+    if self.sync_pid then
         logger.info("OPDS: Sync already in progress, skipping")
         return
     end
@@ -262,13 +267,10 @@ function OPDS:performAutoSync()
         return
     end
 
-    -- Check if enough time has passed since last sync
-    local now = os.time()
-    local time_since_last = now - (self.settings.last_sync_time or 0)
-    local min_interval = self.settings.sync_interval_hours * 3600
-
-    if time_since_last < min_interval then
-        logger.info("OPDS: Last sync too recent, skipping")
+    -- Cap automatic runs to one successful run per interval.
+    local due, why = MakiSync.shouldAutoSync(self.settings, os.time())
+    if not due then
+        logger.info("OPDS: auto-sync skipped:", why)
         return
     end
 
@@ -304,16 +306,18 @@ function OPDS:performAutoSync()
     if self.dns_retry_task then UIManager:unschedule(self.dns_retry_task) end
     self.dns_retries = 0
 
-    self.sync_in_progress = true
     logger.info("OPDS: Starting auto-sync")
+    self:launchSync{ manual = false }
+end
 
-    -- Create browser instance if it doesn't exist
+-- Build the I/O dependency table makisync needs. Everything here is safe to
+-- call from the forked child: no widgets, no UIManager.
+function OPDS:_ensureBrowser()
     if not self.opds_browser then
         self.opds_browser = OPDSBrowser:new{
             servers = self.servers,
             downloads = self.downloads,
             settings = self.settings,
-            pending_syncs = self.pending_syncs,
             title = _("OPDS catalog"),
             is_popout = false,
             is_borderless = true,
@@ -321,13 +325,197 @@ function OPDS:performAutoSync()
             _manager = self,
         }
     end
+    return self.opds_browser
+end
 
-    if self.opds_browser then
-        self.opds_browser.sync_force = false
-        self.opds_browser:checkSyncDownload(nil, true) -- Pass true for auto_sync
+function OPDS:_syncDeps(progress_path)
+    local browser = self:_ensureBrowser()
+    local deps = {
+        fetchFeed = function(feed_url)
+            local ok, catalog = pcall(browser.parseFeed, browser, feed_url)
+            if not ok or not catalog then return nil, tostring(catalog) end
+            return browser:genItemTableFromCatalog(catalog, feed_url)
+        end,
+        fileName = function(item_url, filetype)
+            local ok, name = pcall(browser.getServerFileName, browser, item_url, filetype)
+            if not ok then return nil end
+            return name
+        end,
+        filetype = function(acq) return OPDSBrowser.getFiletype(acq) end,
+        download = function(item_url, path, username, password)
+            util.makePath(path:match("^(.*)/[^/]+$"))
+            local ok, why = browser:downloadFile(path, item_url, username, password, nil, true)
+            if ok then return true end
+            return false, why or "download failed"
+        end,
+        -- Credentials for fetchFeed/getServerFileName come from the browser's
+        -- "current catalog" fields; runSync calls this before each server.
+        useServer = function(srv)
+            browser.root_catalog_username = srv.username
+            browser.root_catalog_password = srv.password
+            browser.root_catalog_title    = srv.title
+        end,
+        exists = function(p) return lfs.attributes(p) ~= nil end,
+        remove = function(p) return os.remove(p) end,
+        rename = function(a, b) return os.rename(a, b) end,
+        now = os.time,
+    }
+    if progress_path then
+        deps.progress = function(st)
+            local f = io.open(progress_path, "w")
+            if f then f:write(dump(st)); f:close() end
+        end
+    end
+    return deps
+end
+
+-- opts: { manual = bool, server_index = n|nil, ignore_ledger = bool }
+function OPDS:launchSync(opts)
+    opts = opts or {}
+    if self.sync_pid then
+        if opts.manual then
+            UIManager:show(InfoMessage:new{ text = _("Sync already running"), timeout = 3 })
+        else
+            logger.info("OPDS: Sync already in progress, skipping")
+        end
+        return
+    end
+    local progress_path
+    if opts.manual then
+        progress_path = DataStorage:getDataDir() .. "/cache/maki-progress.lua"
+        os.remove(progress_path)
+    end
+    local deps = self:_syncDeps(progress_path)
+    local servers, settings = self.servers, self.settings
+    local run_opts = { server_index = opts.server_index, ignore_ledger = opts.ignore_ledger }
+
+    local pid, fd = ffiutil.runInSubProcess(function(_pid, write_fd)
+        local result = MakiSync.runSync(servers, settings, deps, run_opts)
+        ffiutil.writeToFD(write_fd, dump(result), true)
+    end, true)
+    if not pid then
+        logger.warn("Maki: could not fork sync:", fd)
+        if opts.manual then
+            UIManager:show(InfoMessage:new{ text = _("Maki: could not start sync"), timeout = 3 })
+        end
+        return
+    end
+    self.sync_pid, self.sync_fd = pid, fd
+    self.sync_manual = opts.manual and true or false
+    self.sync_progress_path = progress_path
+    logger.info("Maki: sync started, pid", pid, "manual", self.sync_manual)
+
+    if opts.manual then self:_showSyncProgress(_("Maki: starting sync…")) end
+    self.sync_poll_task = self.sync_poll_task or function() self:_pollSync() end
+    UIManager:scheduleIn(SYNC_POLL_SECONDS, self.sync_poll_task)
+end
+
+function OPDS:_showSyncProgress(text)
+    if self.sync_widget then
+        local w = self.sync_widget
+        self.sync_widget = nil
+        w.dismiss_callback = nil
+        UIManager:close(w)
+    end
+    self.sync_widget = InfoMessage:new{
+        text = text,
+        dismiss_callback = function()
+            self.sync_widget = nil
+            self:cancelSync()
+        end,
+    }
+    UIManager:show(self.sync_widget)
+end
+
+function OPDS:_closeSyncProgress()
+    if self.sync_widget then
+        local w = self.sync_widget
+        self.sync_widget = nil
+        w.dismiss_callback = nil
+        UIManager:close(w)
+    end
+end
+
+function OPDS:_pollSync()
+    if not self.sync_pid then return end
+    if not ffiutil.isSubProcessDone(self.sync_pid) then
+        if self.sync_manual and self.sync_progress_path then
+            local f = io.open(self.sync_progress_path, "r")
+            if f then
+                local src = f:read("*a"); f:close()
+                local chunk = src and loadstring("return " .. src)
+                local ok, st = pcall(chunk or function() end)
+                if ok and type(st) == "table" and self.sync_widget then
+                    self:_showSyncProgress(T(_("Maki: %1 (%2/%3)\n%4 downloaded — tap to cancel"),
+                        st.title or "", st.series_index or 0, st.series_total or 0, st.downloaded or 0))
+                end
+            end
+        end
+        UIManager:scheduleIn(SYNC_POLL_SECONDS, self.sync_poll_task)
+        return
     end
 
-    self.sync_in_progress = false
+    local raw = self.sync_fd and ffiutil.readAllFromFD(self.sync_fd) or nil
+    local result
+    if raw and raw ~= "" then
+        local chunk = loadstring("return " .. raw)
+        local ok, r = pcall(chunk or function() end)
+        if ok and type(r) == "table" then result = r end
+    end
+    result = result or { series = {}, downloaded = 0, failed = 0, adopted = 0,
+                         aborted = true, reason = "no result from child" }
+    local was_manual = self.sync_manual
+    self.sync_pid, self.sync_fd, self.sync_manual = nil, nil, false
+    if self.sync_progress_path then os.remove(self.sync_progress_path); self.sync_progress_path = nil end
+    self:_closeSyncProgress()
+    self:_finishSync(result, was_manual)
+end
+
+function OPDS:_finishSync(result, was_manual)
+    logger.info("Maki: sync finished", "downloaded", result.downloaded, "failed", result.failed,
+                "adopted", result.adopted, "aborted", tostring(result.aborted),
+                "cancelled", tostring(result.cancelled), result.reason or "")
+    if not result.aborted and not result.cancelled then
+        self.settings.last_sync_time = os.time()
+        self.updated = true
+        self:saveSettings()
+    end
+    local series_with_new = 0
+    for _, s in ipairs(result.series or {}) do
+        if (s.downloaded or 0) > 0 then series_with_new = series_with_new + 1 end
+    end
+    if was_manual then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Maki: %1 downloaded, %2 failed, %3 adopted%4"),
+                     result.downloaded, result.failed, result.adopted,
+                     result.cancelled and _("\n(cancelled)")
+                        or (result.aborted and ("\n" .. tostring(result.reason)) or "")),
+            timeout = 6,
+        })
+    elseif result.downloaded > 0 then
+        Notification:notify(T(_("Maki: %1 new chapter(s) in %2 series"), result.downloaded, series_with_new))
+    elseif result.aborted then
+        logger.warn("Maki: auto-sync aborted:", result.reason)
+    end
+    if result.downloaded > 0 then self:_refreshFileManager() end
+end
+
+function OPDS:_refreshFileManager()
+    if not (self.ui and self.ui.file_chooser) then return end
+    local home = G_reader_settings:readSetting("home_dir")
+    local target = home and home ~= "" and home or self.ui.file_chooser.path
+    if target then self.ui.file_chooser:changeToPath(target) end
+end
+
+function OPDS:cancelSync()
+    if not self.sync_pid then return end
+    logger.info("Maki: cancelling sync pid", self.sync_pid)
+    ffiutil.terminateSubProcess(self.sync_pid)
+    -- the poller will reap it and report `cancelled`/partial results
+end
+
+function OPDS:onSuspend()
+    if self.sync_pid then self:cancelSync() end
 end
 
 function OPDS:saveSettings()
@@ -335,13 +523,14 @@ function OPDS:saveSettings()
         self.opds_settings:saveSetting("servers", self.servers)
         self.opds_settings:saveSetting("downloads", self.downloads)
         self.opds_settings:saveSetting("settings", self.settings)
-        self.opds_settings:saveSetting("pending_syncs", self.pending_syncs)
         self.opds_settings:flush()
         self.updated = false
     end
 end
 
 function OPDS:onCloseWidget()
+    if self.sync_pid then self:cancelSync() end
+    if self.sync_poll_task then UIManager:unschedule(self.sync_poll_task) end
     UIManager:unschedule(self.periodic_sync_task)
     if self.dns_retry_task then UIManager:unschedule(self.dns_retry_task) end
     self:saveSettings()

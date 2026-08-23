@@ -179,6 +179,7 @@ function M.runSync(servers, settings, deps, opts)
 
     for i, t in ipairs(targets) do
         state.series_index = i
+        if deps.useServer then deps.useServer(t.server) end
         sync_one_series(t.server, t.followed, settings, deps, opts, result, state)
         if result.aborted or result.cancelled then break end
         if result.capped then break end

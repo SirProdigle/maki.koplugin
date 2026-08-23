@@ -98,6 +98,9 @@ local OPDSBrowser = Menu:extend{
 }
 
 function OPDSBrowser:init()
+    -- Maki: the legacy sync queue is no longer owned by main.lua; keep the
+    -- field present so the old code paths can't index a nil.
+    self.pending_syncs = self.pending_syncs or {}
     self.item_table = self:genItemTableFromRoot()
     self.catalog_title = nil
     self.title_bar_left_icon = "appbar.menu"
