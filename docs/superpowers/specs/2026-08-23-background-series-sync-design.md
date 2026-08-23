@@ -34,15 +34,20 @@ A `LuaSettings` file written by *Download all here* and by the seed tool:
 ```lua
 return {
   catalog = "https://komga.bussybox.live/opds/v1.2/catalog", -- server.url it belongs to
-  feed    = "https://komga.bussybox.live/opds/v1.2/series/0QC…", -- the series' own feed
+  feed    = "https://komga.bussybox.live/opds/v1.2/series/0QC…", -- the series' own feed (first page)
   title   = "JoJo's Bizarre Adventure - Part 6 - Stone Ocean",
-  fetched = { ["Official_Chapter 61.cbz"] = 1787496400, … },   -- filename → os.time()
+  fetched = {                                                   -- acquisition URL → record
+    ["https://komga.bussybox.live/opds/v1.2/books/0QD…/file"] = { file = "Official_Chapter 61.cbz", at = 1787496400 },
+    …
+  },
 }
 ```
 
-- `fetched` is keyed by the on-disk filename Maki derives for the entry
-  (`getServerFileName` + `util.getSafeFilename`), i.e. the same string used
-  for the existence check.
+- `fetched` is keyed by the chapter's **acquisition URL** (stable per Komga
+  book), not by filename. Deriving the on-disk filename needs a HEAD request
+  (`getServerFileName` reads `Content-Disposition`), so keying by URL keeps
+  the per-run cost to the feed pages plus one HEAD per *new* chapter. `file`
+  is recorded when known (nil for baseline entries written by the seed tool).
 - Folders without a marker are invisible to auto-sync.
 - Markers are only rewritten when their content changed.
 
@@ -63,11 +68,16 @@ for each server in servers where server.sync and (server.sync_dir or global sync
 return { series = {{title, downloaded, failed}, …}, downloaded, failed, aborted, reason }
 ```
 
-`planSeries(entries, dir, marker)` returns the acquisition entries whose
-derived filename is (a) not on disk and (b) not in `marker.fetched`. That one
-rule covers new chapters, gaps that became available, and never re-fetching
-deleted chapters. Leftover `*.part` files are treated as absent and
-overwritten.
+`planSeries(entries, marker, deps)` decides per acquisition entry:
+
+1. URL in `marker.fetched` → skip (covers deleted-on-purpose chapters).
+2. Otherwise derive the filename (one HEAD). File on disk → *adopt*: record it
+   in `fetched`, no download (covers hand-copied files and pre-marker
+   folders). A leftover `<file>.part` is deleted and treated as absent.
+3. Otherwise → fetch.
+
+That one rule covers new chapters, gaps that became available, and never
+re-fetching deleted chapters.
 
 Manual *Download all here* uses the same downloader but **ignores
 `fetched`** (only skips files on disk) and writes/updates the marker with the
@@ -125,7 +135,7 @@ performAutoSync():
 | file | role |
 |---|---|
 | `makimarker.lua` (new, pure) | `read(dir)`, `write(dir, marker)`, `listFollowed(sync_dir, catalog_url)`, `markFetched(marker, fname, now)` |
-| `makisync.lua` (new) | `planSeries(entries, dir, marker)` (pure), `runSync(servers, settings, deps)` — `deps` injects `fetchFeed`, `download`, `lfs`, `now` for tests |
+| `makisync.lua` (new) | `planSeries(entries, marker, deps)`, `runSync(servers, settings, deps)`, `shouldAutoSync(state, now)` — `deps` injects `fetchFeed`, `fileName`, `download`, `exists`, `remove`, `now` for tests |
 | `main.lua` | gate (§3), `launchSync`, poller, notification (§4) |
 | `makibrowser.lua` | `downloadAllHere` writes marker; sync-queue code removed; "Sync all catalogs" / per-catalog "Sync" call `launchSync{manual=true}` (per-catalog passes the server index) |
 | `tools/seed_markers.lua` (new, one-off) | see below |
@@ -138,8 +148,11 @@ the device (or desktop KOReader with the same `maki.lua`):
 1. For each sync server, fetch root → libraries → series level only (paged).
 2. Sanitise each series title with `sanitize_segment`; match against
    directories in `<sync_dir>/*` that lack a marker.
-3. For matches, write a marker with the series feed URL and
-   `fetched = every file currently in the folder`.
+3. For matches, fetch the series feed once and write a marker whose `fetched`
+   contains **every entry currently on the feed** (`file = nil`, no HEADs).
+   This makes the seed a baseline: chapters absent at seed time are treated as
+   deliberately skipped; only chapters added afterwards are auto-fetched.
+   *Download all here* remains the way to pull the backlog.
 4. Print matched / unmatched so stragglers can be long-pressed manually.
 
 ## Testing
@@ -149,10 +162,11 @@ tana.koplugin (`lua tests/_test_makisync.lua`):
 
 - marker round-trip; `listFollowed` ignores dirs without markers and markers
   for another catalog.
-- `planSeries`: new chapter; gap; chapter on disk; chapter deleted but in
-  `fetched` (skipped); `.part` leftover (re-fetched); `sync_max_dl` cap.
-- `runSync` with stubbed `fetchFeed`/`download`: consecutive-failure abort,
-  marker written only on change, `.part` → rename.
+- `planSeries`: new chapter; gap; chapter on disk (adopted, no download);
+  chapter deleted but in `fetched` (skipped); `.part` leftover (re-fetched);
+  `sync_max_dl` cap.
+- `runSync` with stubbed `fetchFeed`/`fileName`/`download`: consecutive-failure
+  abort, marker written only on change, `.part` → rename, adopt-on-disk.
 - gate: fake clock — "too recent" skip, aborted run does not stamp
   `last_success`, manual bypasses.
 
