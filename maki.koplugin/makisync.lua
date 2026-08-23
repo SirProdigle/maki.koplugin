@@ -65,4 +65,130 @@ function M.shouldAutoSync(settings, now)
     return true
 end
 
+-- Collect acquisition entries from a feed, following rel=next.
+local function collect_entries(feed_url, deps)
+    local entries, url, pages = {}, feed_url, 0
+    while url and pages < 200 do
+        pages = pages + 1
+        local tbl, err = deps.fetchFeed(url)
+        if not tbl then return nil, err or "feed fetch failed" end
+        for _, item in ipairs(tbl) do
+            if item.acquisitions and item.acquisitions[1] then
+                for _, a in ipairs(item.acquisitions) do
+                    if a.href and a.type ~= "borrow" then
+                        local ft = deps.filetype(a)
+                        if ft then
+                            entries[#entries + 1] = { url = a.href, title = item.title or item.text, filetype = ft }
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        url = tbl.hrefs and tbl.hrefs.next or nil
+    end
+    return entries
+end
+
+local function sync_one_series(server, followed, settings, deps, opts, result, state)
+    local marker, dir = followed.marker, followed.dir
+    local rec = { title = marker.title or dir:match("[^/]+$"), dir = dir,
+                  downloaded = 0, failed = 0, adopted = 0, feed_failed = false }
+    result.series[#result.series + 1] = rec
+
+    local entries, err = collect_entries(marker.feed, deps)
+    if not entries then
+        logger.warn("Maki: feed failed for", rec.title, err)
+        rec.feed_failed = true
+        return
+    end
+    state.feeds_ok = state.feeds_ok + 1
+
+    local plan_marker = marker
+    if opts.ignore_ledger then
+        plan_marker = { fetched = {} }
+    end
+    local plan = M.planSeries(entries, dir, plan_marker, deps)
+    if opts.ignore_ledger then
+        -- adoptions discovered against the empty ledger still belong in the real one
+        for url, rec_ in pairs(plan_marker.fetched) do
+            if Marker.markFetched(marker, url, rec_.file, rec_.at) then plan.changed = true end
+        end
+    end
+    rec.adopted = plan.adopted
+    result.adopted = result.adopted + plan.adopted
+
+    for _, item in ipairs(plan.to_fetch) do
+        if result.downloaded >= state.max_dl then result.capped = true; break end
+        if deps.cancelled and deps.cancelled() then result.cancelled = true; break end
+        local tmp = item.path .. ".part"
+        local ok, why = deps.download(item.url, tmp, server.username, server.password)
+        if ok then
+            local rok, rerr = deps.rename(tmp, item.path)
+            if not rok then ok, why = false, rerr or "rename failed" end
+        end
+        if ok then
+            if Marker.markFetched(marker, item.url, item.file, deps.now()) then plan.changed = true end
+            rec.downloaded = rec.downloaded + 1
+            result.downloaded = result.downloaded + 1
+            state.consecutive_failures = 0
+        else
+            deps.remove(tmp)
+            rec.failed = rec.failed + 1
+            result.failed = result.failed + 1
+            state.consecutive_failures = state.consecutive_failures + 1
+            result.reason = result.reason or why
+            logger.warn("Maki: download failed", item.path, why)
+            if state.consecutive_failures >= M.ABORT_AFTER_CONSECUTIVE_FAILURES then
+                result.aborted = true
+                break
+            end
+        end
+        if deps.progress then
+            deps.progress({ series_index = state.series_index, series_total = state.series_total,
+                            title = rec.title, downloaded = result.downloaded, total_planned = #plan.to_fetch })
+        end
+    end
+
+    if plan.changed then
+        local wok, werr = Marker.write(dir, marker, deps.marker)
+        if not wok then logger.warn("Maki: marker write failed", dir, werr) end
+    end
+end
+
+-- Entry point for the forked child (and the seed tool / tests).
+-- opts: { server_index = n|nil, ignore_ledger = bool }
+function M.runSync(servers, settings, deps, opts)
+    opts = opts or {}
+    local result = { series = {}, downloaded = 0, failed = 0, adopted = 0,
+                     aborted = false, capped = false, cancelled = false, reason = nil }
+    local state = { max_dl = settings.sync_max_dl or 50, consecutive_failures = 0,
+                    feeds_ok = 0, series_index = 0, series_total = 0 }
+
+    local targets = {}
+    for i, srv in ipairs(servers) do
+        if (not opts.server_index or opts.server_index == i)
+           and srv.sync and (srv.sync_dir or settings.sync_dir) then
+            local sync_dir = srv.sync_dir or settings.sync_dir
+            for _, f in ipairs(Marker.listFollowed(sync_dir, srv.url, deps.marker)) do
+                targets[#targets + 1] = { server = srv, followed = f }
+            end
+        end
+    end
+    state.series_total = #targets
+
+    for i, t in ipairs(targets) do
+        state.series_index = i
+        sync_one_series(t.server, t.followed, settings, deps, opts, result, state)
+        if result.aborted or result.cancelled then break end
+        if result.capped then break end
+    end
+
+    if #targets > 0 and state.feeds_ok == 0 then
+        result.aborted = true
+        result.reason = result.reason or "all feeds failed"
+    end
+    return result
+end
+
 return M

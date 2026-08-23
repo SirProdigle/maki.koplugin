@@ -17,6 +17,8 @@ end
 
 local S = dofile("makisync.lua")
 
+local function dofile_string(src) return assert(loadstring and loadstring(src) or load(src))() end
+
 local pass, fail = 0, 0
 local function test(name, fn)
     local ok, err = pcall(fn)
@@ -118,6 +120,150 @@ end)
 test("shouldAutoSync: missing interval defaults to 24h", function()
     local ok = S.shouldAutoSync({ last_sync_time = 1000 }, 1000 + 23 * 3600)
     assert(ok == false)
+end)
+
+
+-- ─── runSync ─────────────────────────────────────────────────────────────
+
+-- Full fake world: markers in memory (via makimarker deps), feeds keyed by URL,
+-- downloads succeed unless listed in `fail_urls`.
+local function world(opts)
+    opts = opts or {}
+    local files, dirs = {}, {}
+    local markers = {}   -- dir -> marker source
+    local feeds = opts.feeds or {}
+    local names = opts.names or {}
+    local fail_urls = opts.fail_urls or {}
+    local log = {}
+    local marker_deps = {
+        readFile = function(p) return markers[p] end,
+        writeFile = function(p, c) markers[p] = c; log[#log + 1] = "mwrite " .. p; return true end,
+        rename = function(a, b) markers[b] = markers[a]; markers[a] = nil; return true end,
+        listDirs = function(p) return dirs[p] or {} end,
+    }
+    local deps = {
+        marker = marker_deps,
+        fetchFeed = function(url)
+            log[#log + 1] = "feed " .. url
+            local f = feeds[url]
+            if not f then return nil, "404" end
+            return f
+        end,
+        fileName = function(url) return names[url] end,
+        filetype = function(acq) return acq.type ~= "borrow" and "cbz" or nil end,
+        download = function(url, path)
+            log[#log + 1] = "dl " .. url
+            if fail_urls[url] then return false, "http 500" end
+            files[path] = true; return true
+        end,
+        exists = function(p) return files[p] == true end,
+        remove = function(p) files[p] = nil; return true end,
+        rename = function(a, b) files[b] = files[a]; files[a] = nil; return true end,
+        now = function() return 500 end,
+    }
+    local function seed_marker(dir, catalog, feed, fetched)
+        markers[dir .. "/.maki.lua"] = "return " .. package.loaded["dump"]({
+            catalog = catalog, feed = feed, title = dir:match("[^/]+$"), fetched = fetched or {} })
+    end
+    return { files = files, dirs = dirs, markers = markers, deps = deps, log = log, seed = seed_marker }
+end
+
+local function acq(url) return { url = url, acquisitions = { { href = url, type = "application/zip" } }, title = url } end
+local function page(entries, next_url) local t = entries; t.hrefs = { next = next_url }; return t end
+
+local SERVERS = { { title = "K", url = "C", sync = true, sync_dir = "/m", username = "u", password = "p" } }
+
+test("runSync: downloads new chapters, writes ledger, renames .part", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2") }) }, names = { u1 = "c1.cbz", u2 = "c2.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, { sync_max_dl = 50 }, w.deps, {})
+    assert(r.downloaded == 2 and r.failed == 0 and r.aborted == false, "r=" .. tostring(r.downloaded))
+    assert(w.files["/m/S/c1.cbz"] and w.files["/m/S/c2.cbz"])
+    assert(w.files["/m/S/c1.cbz.part"] == nil)
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched.u1.file == "c1.cbz" and mk.fetched.u2.at == 500)
+    assert(r.series[1].title == "S" and r.series[1].downloaded == 2)
+end)
+
+test("runSync: follows pagination", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }, "fs2"), fs2 = page({ acq("u2") }) },
+                      names = { u1 = "c1.cbz", u2 = "c2.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 2)
+end)
+
+test("runSync: ledger entries are skipped; nothing written when unchanged", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 0)
+    for _, l in ipairs(w.log) do assert(not l:match("^mwrite"), "marker must not be rewritten") end
+end)
+
+test("runSync: ignore_ledger re-fetches deleted chapters", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    local r = S.runSync(SERVERS, {}, w.deps, { ignore_ledger = true })
+    assert(r.downloaded == 1 and w.files["/m/S/c1.cbz"])
+end)
+
+test("runSync: sync_max_dl caps the run", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2"), acq("u3") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
+    assert(r.downloaded == 2 and r.capped == true)
+end)
+
+test("runSync: consecutive failures abort, ledger progress kept", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2"), acq("u3"), acq("u4") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz", u4 = "4.cbz" },
+                      fail_urls = { u2 = true, u3 = true } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and r.failed == 2 and r.aborted == true and r.reason == "http 500")
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched.u1 and not mk.fetched.u2)
+    local dls = 0; for _, l in ipairs(w.log) do if l:match("^dl") then dls = dls + 1 end end
+    assert(dls == 3, "u4 must not be attempted")
+end)
+
+test("runSync: one feed failing does not abort others; all failing aborts", function()
+    local w = world({ feeds = { fb = page({ acq("u1") }) }, names = { u1 = "1.cbz" } })
+    w.dirs["/m"] = { "A", "B" }; w.seed("/m/A", "C", "fa"); w.seed("/m/B", "C", "fb")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and r.aborted == false)
+    assert(r.series[1].feed_failed == true and r.series[2].downloaded == 1)
+    local w2 = world({})
+    w2.dirs["/m"] = { "A" }; w2.seed("/m/A", "C", "fa")
+    local r2 = S.runSync(SERVERS, {}, w2.deps, {})
+    assert(r2.aborted == true)
+end)
+
+test("runSync: server_index restricts to one server; unsynced servers ignored", function()
+    local servers = {
+        { title = "X", url = "CX", sync = false, sync_dir = "/x" },
+        { title = "K", url = "C", sync = true, sync_dir = "/m" },
+    }
+    local w = world({ feeds = { fs = page({ acq("u1") }) }, names = { u1 = "1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(servers, {}, w.deps, { server_index = 2 })
+    assert(r.downloaded == 1)
+    local r0 = S.runSync(servers, {}, w.deps, { server_index = 1 })
+    assert(r0.downloaded == 0 and r0.aborted == false)
+end)
+
+test("runSync: progress callback and cancel", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2") }) }, names = { u1 = "1.cbz", u2 = "2.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local seen = {}
+    w.deps.progress = function(st) seen[#seen + 1] = st.downloaded end
+    local calls = 0
+    w.deps.cancelled = function() calls = calls + 1; return calls > 1 end
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and r.cancelled == true)
+    assert(seen[1] == 1)
 end)
 
 print(string.format("%d/%d tests passed", pass, pass + fail))

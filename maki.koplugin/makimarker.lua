@@ -3,7 +3,16 @@
 -- writer, a helper to list followed series directories for one catalog
 -- URL, and `markFetched` which never overwrites an existing ledger entry.
 --
--- Marker shape: { catalog_url = <string|nil>, fetched = { [url] = { file = <string|nil>, at = <number> }, ... } }
+-- Marker shape:
+--   { catalog = <server url>, feed = <series feed url>, title = <string>,
+--     fetched = { [acquisition_url] = { file = <string|nil>, at = <number> }, ... } }
+--
+-- Every side effect goes through an optional `deps` table so the same code
+-- runs in unit tests, in the forked child and in the seed tool:
+--   readFile(path)          -> contents | nil
+--   writeFile(path, data)   -> ok, err
+--   rename(from, to)        -> ok, err
+--   listDirs(path)          -> { name, ... }
 
 local dump = require("dump")
 local logger = require("logger")
@@ -13,20 +22,52 @@ local MARKER_FILENAME = ".maki.lua"
 local M = {}
 M.MARKER_FILENAME = MARKER_FILENAME
 
--- Lenient read: any parse/IO failure yields a fresh marker with an empty
--- `fetched` table rather than erroring.
-function M.read(path)
-    local ok_read, contents = pcall(function()
+local io_deps = {
+    readFile = function(path)
         local f = io.open(path, "r")
         if not f then return nil end
         local data = f:read("*a")
         f:close()
         return data
-    end)
+    end,
+    writeFile = function(path, data)
+        local f = io.open(path, "w")
+        if not f then return false, "could not open " .. path end
+        f:write(data)
+        f:close()
+        return true
+    end,
+    rename = function(a, b) return os.rename(a, b) end,
+    listDirs = function(path)
+        local names = {}
+        local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+        if not ok then return names end
+        for name in lfs.dir(path) do
+            if name ~= "." and name ~= ".." then
+                local attr = lfs.attributes(path .. "/" .. name)
+                if attr and attr.mode == "directory" then names[#names + 1] = name end
+            end
+        end
+        return names
+    end,
+}
+
+local function D(deps) return deps or io_deps end
+
+local function strip_slash(p) return (p:gsub("/+$", "")) end
+
+function M.path(dir) return strip_slash(dir) .. "/" .. MARKER_FILENAME end
+
+-- Lenient read: any parse/IO failure yields a fresh marker with an empty
+-- `fetched` table rather than erroring. Accepts a series dir.
+function M.read(dir, deps)
+    local path = M.path(dir)
+    local ok_read, contents = pcall(D(deps).readFile, path)
     if not ok_read or not contents then
         return { fetched = {} }
     end
-    local chunk, load_err = load(contents, "@" .. path)
+    local loader = load or loadstring
+    local chunk, load_err = loader(contents, "@" .. path)
     if not chunk then
         logger.warn("Maki: failed to parse marker", path, load_err)
         return { fetched = {} }
@@ -40,36 +81,31 @@ function M.read(path)
     return marker
 end
 
--- Atomic write via a sibling `.tmp` file + rename.
-function M.write(path, marker)
+-- Atomic write via a sibling `.tmp` file + rename. Accepts a series dir.
+function M.write(dir, marker, deps)
+    deps = D(deps)
+    local path = M.path(dir)
     local tmp_path = path .. ".tmp"
-    local f = io.open(tmp_path, "w")
-    if not f then
-        return false, "could not open " .. tmp_path
-    end
-    f:write("return " .. dump(marker) .. "\n")
-    f:close()
-    local ok, err = os.rename(tmp_path, path)
-    if not ok then
-        return false, err
-    end
+    local ok, err = deps.writeFile(tmp_path, "return " .. dump(marker) .. "\n")
+    if not ok then return false, err or ("could not write " .. tmp_path) end
+    local rok, rerr = deps.rename(tmp_path, path)
+    if not rok then return false, rerr end
     return true
 end
 
 -- List directories under `dir` that carry a marker for `catalog_url`.
--- deps: { listDirs(dir) -> {name, ...}, exists(path) -> bool, joinPath(a,b) -> path (optional) }
 function M.listFollowed(dir, catalog_url, deps)
-    local join = deps.joinPath or function(a, b) return a .. "/" .. b end
+    deps = D(deps)
+    dir = strip_slash(dir)
     local followed = {}
-    local names = deps.listDirs(dir) or {}
-    for _, name in ipairs(names) do
-        local series_dir = join(dir, name)
-        local marker_path = join(series_dir, MARKER_FILENAME)
-        if deps.exists(marker_path) then
-            local marker = M.read(marker_path)
-            if marker.catalog_url == catalog_url then
-                followed[#followed + 1] = { dir = series_dir, marker = marker, marker_path = marker_path }
-            end
+    for _, name in ipairs(deps.listDirs(dir) or {}) do
+        local series_dir = dir .. "/" .. name
+        local marker = M.read(series_dir, deps)
+        local catalog = marker.catalog or marker.catalog_url
+        if catalog and catalog == catalog_url then
+            followed[#followed + 1] = {
+                dir = series_dir, marker = marker, marker_path = M.path(series_dir),
+            }
         end
     end
     return followed
