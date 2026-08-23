@@ -159,6 +159,16 @@ function OPDSBrowser:showOPDSMenu()
                     align = "left",
             }},
             {{
+                    text = _("Seed markers (one-off)"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        NetworkMgr:runWhenConnected(function()
+                            require("tools/seed_markers").run(self._manager)
+                        end)
+                    end,
+                    align = "left",
+            }},
+            {{
                     text = _("Set max number of files to sync"),
                     callback = function()
                         self:setMaxSyncDownload()
