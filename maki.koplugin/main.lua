@@ -18,6 +18,10 @@ local dump = require("dump")
 local MakiSync = require("makisync")
 local lfs = require("libs/libkoreader-lfs")
 
+-- `loadstring` under LuaJIT, `load` under 5.4; reached via rawget so static
+-- analysis does not see an undefined global.
+local load_chunk = rawget(_G, "loadstring") or load
+
 -- Maki: after a reboot the WiFi interface comes up several seconds before the
 -- DNS resolver is usable. NetworkMgr:isOnline() is already true at that point,
 -- so a sync started then fails every queued file. Probe DNS and back off.
@@ -450,7 +454,7 @@ function OPDS:_pollSync()
             local f = io.open(self.sync_progress_path, "r")
             if f then
                 local src = f:read("*a"); f:close()
-                local chunk = src and loadstring("return " .. src)
+                local chunk = src and load_chunk("return " .. src)
                 local ok, st = pcall(chunk or function() end)
                 if ok and type(st) == "table" and self.sync_widget then
                     self:_showSyncProgress(T(_("Maki: %1 (%2/%3)\n%4 downloaded — tap to cancel"),
@@ -465,7 +469,7 @@ function OPDS:_pollSync()
     local raw = self.sync_fd and ffiutil.readAllFromFD(self.sync_fd) or nil
     local result
     if raw and raw ~= "" then
-        local chunk = loadstring("return " .. raw)
+        local chunk = load_chunk("return " .. raw)
         local ok, r = pcall(chunk or function() end)
         if ok and type(r) == "table" then result = r end
     end
