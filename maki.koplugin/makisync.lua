@@ -189,6 +189,19 @@ function M.runSync(servers, settings, deps, opts)
         result.aborted = true
         result.reason = result.reason or "all feeds failed"
     end
+
+    -- The result crosses a pipe that the parent only drains once the child has
+    -- exited: a record per followed series would fill the pipe buffer on a big
+    -- shelf and wedge the child in write() forever. Only series that actually
+    -- did something are worth reporting; the totals carry the rest.
+    local reported = {}
+    for _, rec in ipairs(result.series) do
+        if rec.downloaded > 0 or rec.failed > 0 or rec.feed_failed then
+            reported[#reported + 1] = { title = rec.title, downloaded = rec.downloaded,
+                                        failed = rec.failed, feed_failed = rec.feed_failed or nil }
+        end
+    end
+    result.series = reported
     return result
 end
 

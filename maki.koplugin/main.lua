@@ -312,9 +312,14 @@ end
 
 -- Build the I/O dependency table makisync needs. Everything here is safe to
 -- call from the forked child: no widgets, no UIManager.
+-- A browser instance that is never shown: it only lends its HTTP/OPDS
+-- methods to the sync child and the seed tool. `sync = true` marks it
+-- headless — fetchFeed logs instead of showing a dialog, and OpenSearch /
+-- facet discovery (an extra feed fetch per page) is skipped. It is kept
+-- apart from `self.opds_browser` so the on-screen browser keeps search.
 function OPDS:_ensureBrowser()
-    if not self.opds_browser then
-        self.opds_browser = OPDSBrowser:new{
+    if not self.sync_browser then
+        self.sync_browser = OPDSBrowser:new{
             servers = self.servers,
             downloads = self.downloads,
             settings = self.settings,
@@ -322,10 +327,11 @@ function OPDS:_ensureBrowser()
             is_popout = false,
             is_borderless = true,
             title_bar_fm_style = true,
+            sync = true,
             _manager = self,
         }
     end
-    return self.opds_browser
+    return self.sync_browser
 end
 
 function OPDS:_syncDeps(progress_path)
@@ -380,6 +386,7 @@ function OPDS:launchSync(opts)
         end
         return
     end
+    self.sync_cancelling = false
     local progress_path
     if opts.manual then
         progress_path = DataStorage:getDataDir() .. "/cache/maki-progress.lua"
@@ -464,6 +471,13 @@ function OPDS:_pollSync()
     end
     result = result or { series = {}, downloaded = 0, failed = 0, adopted = 0,
                          aborted = true, reason = "no result from child" }
+    -- A terminated child never gets to write its result, so the pipe is empty
+    -- or truncated. Report it as cancelled (not aborted) so the summary is
+    -- honest; either way `last_sync_time` is left alone.
+    if self.sync_cancelling then
+        result.cancelled = true
+        self.sync_cancelling = false
+    end
     local was_manual = self.sync_manual
     self.sync_pid, self.sync_fd, self.sync_manual = nil, nil, false
     if self.sync_progress_path then os.remove(self.sync_progress_path); self.sync_progress_path = nil end
@@ -510,6 +524,7 @@ end
 function OPDS:cancelSync()
     if not self.sync_pid then return end
     logger.info("Maki: cancelling sync pid", self.sync_pid)
+    self.sync_cancelling = true
     ffiutil.terminateSubProcess(self.sync_pid)
     -- the poller will reap it and report `cancelled`/partial results
 end

@@ -94,20 +94,33 @@ function M.write(dir, marker, deps)
 end
 
 -- List directories under `dir` that carry a marker for `catalog_url`.
-function M.listFollowed(dir, catalog_url, deps)
+-- Series do not always sit directly under the sync folder: *Download all
+-- here* on a library writes <sync_dir>/<library>/<series>/.maki.lua, so scan
+-- a few levels down. A directory that already carries a marker is a series —
+-- never descend into it.
+M.MAX_DEPTH = 3
+
+function M.listFollowed(dir, catalog_url, deps, max_depth)
     deps = D(deps)
-    dir = strip_slash(dir)
+    max_depth = max_depth or M.MAX_DEPTH
     local followed = {}
-    for _, name in ipairs(deps.listDirs(dir) or {}) do
-        local series_dir = dir .. "/" .. name
-        local marker = M.read(series_dir, deps)
-        local catalog = marker.catalog or marker.catalog_url
-        if catalog and catalog == catalog_url then
-            followed[#followed + 1] = {
-                dir = series_dir, marker = marker, marker_path = M.path(series_dir),
-            }
+    local function scan(base, depth)
+        for _, name in ipairs(deps.listDirs(base) or {}) do
+            local series_dir = base .. "/" .. name
+            local marker = M.read(series_dir, deps)
+            local catalog = marker.catalog or marker.catalog_url
+            if catalog then
+                if catalog == catalog_url then
+                    followed[#followed + 1] = {
+                        dir = series_dir, marker = marker, marker_path = M.path(series_dir),
+                    }
+                end
+            elseif depth < max_depth then
+                scan(series_dir, depth + 1)
+            end
         end
     end
+    scan(strip_slash(dir), 1)
     return followed
 end
 

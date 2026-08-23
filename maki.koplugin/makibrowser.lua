@@ -821,6 +821,13 @@ function OPDSBrowser:fetchFeed(item_url, headers_only)
         }
         text = code and error_message[tostring(code)] or T(_("Cannot get catalog. Server response status: %1."), status or code)
     end
+    -- Maki: `self.sync` marks a headless browser (the forked sync child, the
+    -- seed tool). Nothing there may build or show a widget, so report the
+    -- failure to the log and let the caller's `nil` return do the talking.
+    if self.sync then
+        logger.warn(string.format("Maki: failed to fetch catalog `%s`: %s", item_url, text))
+        return
+    end
     UIManager:show(InfoMessage:new{
         text = text,
         icon = icon,

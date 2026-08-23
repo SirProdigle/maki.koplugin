@@ -6,6 +6,7 @@ local UIManager = require("ui/uimanager")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local Marker = require("makimarker")
+local OPDSBrowser = require("makibrowser")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -89,8 +90,17 @@ function M.run(plugin)
                     if has_marker(dir) then skipped[#skipped + 1] = folder; return end
                     local marker = { catalog = srv.url, feed = feed_url, title = title, fetched = {} }
                     for _i, it in ipairs(items) do
-                        local a = it.acquisitions and it.acquisitions[1]
-                        if a and a.href then marker.fetched[a.href] = { at = now } end
+                        -- Pick the same link makisync would: the first
+                        -- non-borrow acquisition with a known filetype.
+                        -- acquisitions[1] is not always it (Komga lists a
+                        -- borrow link first for some entries), and a baseline
+                        -- keyed by the wrong URL would not suppress anything.
+                        for _j, a in ipairs(it.acquisitions or {}) do
+                            if a.href and a.type ~= "borrow" and OPDSBrowser.getFiletype(a) then
+                                marker.fetched[a.href] = { at = now }
+                                break
+                            end
+                        end
                     end
                     local ok, err = Marker.write(dir, marker)
                     if ok then matched[#matched + 1] = folder

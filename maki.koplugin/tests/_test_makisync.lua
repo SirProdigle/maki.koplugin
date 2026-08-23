@@ -254,6 +254,34 @@ test("runSync: server_index restricts to one server; unsynced servers ignored", 
     assert(r0.downloaded == 0 and r0.aborted == false)
 end)
 
+test("runSync: finds markers nested below the sync dir", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }) }, names = { u1 = "1.cbz" } })
+    w.dirs["/m"] = { "Lib" }; w.dirs["/m/Lib"] = { "S" }
+    w.seed("/m/Lib/S", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and w.files["/m/Lib/S/1.cbz"])
+end)
+
+test("runSync: a marked series folder is not descended into", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }) }, names = { u1 = "1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.dirs["/m/S"] = { "extras" }
+    w.seed("/m/S", "C", "fs"); w.seed("/m/S/extras", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1, "the nested marker must be ignored")
+end)
+
+test("runSync: only series that did something are reported", function()
+    local w = world({ feeds = { fa = page({ acq("u1") }), fb = page({ acq("u2") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz" } })
+    w.dirs["/m"] = { "A", "B" }
+    w.seed("/m/A", "C", "fa", { u1 = { file = "1.cbz", at = 1 } })  -- nothing to do
+    w.seed("/m/B", "C", "fb")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1)
+    assert(#r.series == 1 and r.series[1].title == "B", "#series=" .. #r.series)
+    assert(r.series[1].dir == nil, "dir is dead weight in the pipe")
+end)
+
 test("runSync: progress callback and cancel", function()
     local w = world({ feeds = { fs = page({ acq("u1"), acq("u2") }) }, names = { u1 = "1.cbz", u2 = "2.cbz" } })
     w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
