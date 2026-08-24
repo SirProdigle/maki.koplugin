@@ -4,6 +4,7 @@ local ButtonDialog = require("ui/widget/buttondialog")
 local Cache = require("cache")
 local CheckButton = require("ui/widget/checkbutton")
 local ConfirmBox = require("ui/widget/confirmbox")
+local DataStorage = require("datastorage")
 local Device = require("device")
 local DocumentRegistry = require("document/documentregistry")
 local InfoMessage = require("ui/widget/infomessage")
@@ -17,6 +18,7 @@ local OPDSParser = require("makiparser")
 local Marker = require("makimarker")
 local OPDSPSE = require("makipse")
 local MakiHTTP = require("makihttp")
+local MakiBulk = require("makibulk")
 local MakiNames = require("makinames")
 local SpinWidget = require("ui/widget/spinwidget")
 local TextViewer = require("ui/widget/textviewer")
@@ -29,6 +31,7 @@ local logger = require("logger")
 local ltn12 = require("ltn12")
 local socket = require("socket")
 local socketutil = require("socketutil")
+local time = require("ui/time")
 local url = require("socket.url")
 local util = require("util")
 local _ = require("gettext")
@@ -2190,147 +2193,361 @@ function OPDSBrowser:downloadAllHere(item)
     })
 end
 
--- Scan the subtree, plan target paths, then download sequentially with live
--- progress driven by Trapper:info. Must be called inside Trapper:wrap.
+-- ── Bulk download ────────────────────────────────────────────────────────
+-- The bulk fetch runs in parallel worker subprocesses (same fork mechanism
+-- as Trapper:dismissableRunInSubprocess). The old implementation was
+-- UI-bound, not network-bound: every file cost one Trapper:info in the
+-- "Preparing" HEAD pass and another in the download loop, and each of those
+-- is a full e-ink repaint plus a mandatory 0.1s dismiss-check yield —
+-- ~0.5s/file of pure overhead before any bytes moved. Now the workers run
+-- flat out and the parent only repaints a small progress dialog every
+-- BULK_UI_INTERVAL seconds.
+
+local BULK_WORKERS = 3        -- parallel download subprocesses
+local BULK_UI_INTERVAL = 2.5  -- min seconds between progress repaints
+
+-- Resolve the server-side filename for one plan item (HEAD over the
+-- keepalive connection), skip it if already on disk, otherwise download to
+-- `part_path` and rename into place. Returns "ok"/"skip"/"fail", filename.
+-- UI-free: runs inside worker subprocesses.
+function OPDSBrowser:_bulkFetchOne(ka, p, part_path)
+    util.makePath(p.dir)
+    local filename
+    local headers = ka and ka:headURL(p.url)
+    if headers then
+        filename = OPDSBrowser.fileNameFromHeaders(headers, p.url, p.filetype)
+    else
+        filename = self:getServerFileName(p.url, p.filetype)
+    end
+    filename = util.getSafeFilename(filename, p.dir)
+    local target = util.fixUtf8(p.dir .. "/" .. filename, "_")
+    if lfs.attributes(target) then
+        return "skip", filename
+    end
+    local ok
+    if ka then
+        ok = ka:downloadURL(p.url, part_path)
+        if ok == nil then -- host mismatch: fall back to the plain client
+            ok = self:downloadFile(part_path, p.url, self.root_catalog_username,
+                                   self.root_catalog_password, nil, true)
+        end
+    else
+        ok = self:downloadFile(part_path, p.url, self.root_catalog_username,
+                               self.root_catalog_password, nil, true)
+    end
+    if ok and lfs.attributes(part_path) and os.rename(part_path, target) then
+        return "ok", filename
+    end
+    pcall(os.remove, part_path)
+    return "fail", filename
+end
+
+-- Fetch every plan item with BULK_WORKERS forked subprocesses. The parent
+-- polls per-worker manifest files for progress, keeps the UI responsive
+-- (tap → confirm-cancel), and repaints at most every BULK_UI_INTERVAL.
+-- Returns results (idx → {status, name}), cancelled — or nil if fork is
+-- unavailable (caller falls back to the sequential path).
+function OPDSBrowser:_bulkFetchParallel(plan)
+    if #plan < 2 then return nil end
+    -- Never fork inside an Android app process: our exiting workers race
+    -- ART's "process reaper" thread over waitpid()/mutex state and the whole
+    -- app SIGABRTs (observed on the Boox Go 10.3: "FORTIFY:
+    -- pthread_mutex_lock called on a destroyed mutex" in tid "process
+    -- reaper"). Android takes the sequential keepalive path instead; true
+    -- parallelism is reserved for POSIX platforms (Kindle etc.).
+    if Device:isAndroid() then return nil end
+    local _coroutine = coroutine.running()
+    if not _coroutine then return nil end
+    local n_workers = math.min(BULK_WORKERS, #plan)
+    local tmp_dir = DataStorage:getDataDir() .. "/cache"
+    util.makePath(tmp_dir)
+    local stamp = tostring(os.time())
+    local base_url = plan[1].url:match("^(https://[^/]+)") or ""
+    local username, password = self.root_catalog_username, self.root_catalog_password
+
+    local manifests, workers = {}, {}
+    for k = 1, n_workers do
+        manifests[k] = string.format("%s/maki-bulk-%s-%d.tsv", tmp_dir, stamp, k)
+        pcall(os.remove, manifests[k])
+        local manifest_path = manifests[k]
+        local slice = MakiBulk.workerSlice(#plan, n_workers, k)
+        local worker_id = k
+        local pid = ffiUtil.runInSubProcess(function()
+            local mf = io.open(manifest_path, "a")
+            if not mf then return end
+            local ka = MakiHTTP.Client:new{
+                base_url = base_url,
+                username = username,
+                password = password,
+            }
+            for _, idx in ipairs(slice) do
+                local p = plan[idx]
+                local part = p.dir .. "/.maki-part-" .. worker_id
+                mf:write("part\t", idx, "\t", part, "\n")
+                mf:flush()
+                local ok_run, status, name = pcall(self._bulkFetchOne, self, ka, p, part)
+                if not ok_run then
+                    logger.warn("Maki bulk worker error:", status)
+                    status, name = "fail", nil
+                end
+                mf:write(status, "\t", idx, "\t", name or "", "\n")
+                mf:flush()
+            end
+            if ka then ka:close() end
+            mf:close()
+        end)
+        if not pid then
+            for _, w in ipairs(workers) do ffiUtil.terminateSubProcess(w.pid) end
+            for _, m in ipairs(manifests) do pcall(os.remove, m) end
+            return nil
+        end
+        workers[#workers + 1] = { pid = pid }
+    end
+
+    local total = #plan
+    local info_widget
+    local function show_progress(text)
+        if info_widget then UIManager:close(info_widget) end
+        info_widget = InfoMessage:new{
+            text = text,
+            dismiss_callback = function()
+                info_widget = nil -- the tap already closed it
+                coroutine.resume(_coroutine, "dismiss")
+            end,
+            flush_events_on_show = true,
+        }
+        UIManager:show(info_widget)
+        UIManager:forceRePaint()
+    end
+    local function read_manifests()
+        local results, orphans = {}, {}
+        for _, m in ipairs(manifests) do
+            local f = io.open(m, "r")
+            if f then
+                MakiBulk.parseManifest(f:read("*a"), results, orphans)
+                f:close()
+            end
+        end
+        return results, orphans
+    end
+    local function progress_text(results)
+        local done, new_n, have_n, fail_n = 0, 0, 0, 0
+        for _, r in pairs(results) do
+            done = done + 1
+            if r.status == "ok" then new_n = new_n + 1
+            elseif r.status == "skip" then have_n = have_n + 1
+            else fail_n = fail_n + 1 end
+        end
+        return T(_("Downloading %1 / %2 (%3 at a time)\n%4 new · %5 already present · %6 failed\nTap to cancel"),
+                 done, total, n_workers, new_n, have_n, fail_n), done
+    end
+
+    local cancelled = false
+    local results = {}
+    show_progress(T(_("Downloading %1 file(s), %2 at a time…\nTap to cancel"), total, n_workers))
+    local last_paint_s = time.to_s(time.now())
+    local last_done = -1
+    while true do
+        local tick = function() coroutine.resume(_coroutine, "tick") end
+        UIManager:scheduleIn(0.5, tick)
+        local reason = coroutine.yield()
+        if reason == "dismiss" then
+            UIManager:unschedule(tick)
+            -- Workers keep downloading while the user decides.
+            local confirm = ConfirmBox:new{
+                text = _("Stop the bulk download?"),
+                ok_text = _("Stop"),
+                cancel_text = _("Continue"),
+                ok_callback = function() coroutine.resume(_coroutine, "stop") end,
+                cancel_callback = function() coroutine.resume(_coroutine, "go") end,
+                flush_events_on_show = true,
+            }
+            UIManager:show(confirm)
+            local answer = coroutine.yield()
+            UIManager:close(confirm)
+            if answer == "stop" then
+                cancelled = true
+                for _, w in ipairs(workers) do
+                    if not w.done then ffiUtil.terminateSubProcess(w.pid) end
+                end
+                break
+            end
+            show_progress((progress_text(read_manifests())))
+            last_paint_s = time.to_s(time.now())
+        else
+            results = read_manifests()
+            local all_done = true
+            for _, w in ipairs(workers) do
+                if not w.done and ffiUtil.isSubProcessDone(w.pid) then w.done = true end
+                if not w.done then all_done = false end
+            end
+            if all_done then break end
+            local text, done = progress_text(results)
+            if done ~= last_done
+               and time.to_s(time.now()) - last_paint_s >= BULK_UI_INTERVAL then
+                show_progress(text)
+                last_paint_s = time.to_s(time.now())
+                last_done = done
+            end
+        end
+    end
+
+    -- Final manifest read (workers may have written after our last poll),
+    -- then clean up temp part files and manifests.
+    local orphans
+    results, orphans = read_manifests()
+    for _, part in ipairs(orphans) do pcall(os.remove, part) end
+    for _, m in ipairs(manifests) do pcall(os.remove, m) end
+    if cancelled then
+        -- Terminated workers still need reaping so they don't linger as
+        -- zombies; poll in the background, no hurry.
+        local collect
+        collect = function()
+            local pending = false
+            for _, w in ipairs(workers) do
+                if not w.done then
+                    if ffiUtil.isSubProcessDone(w.pid) then w.done = true
+                    else pending = true end
+                end
+            end
+            if pending then UIManager:scheduleIn(2, collect) end
+        end
+        UIManager:scheduleIn(2, collect)
+    end
+    if info_widget then UIManager:close(info_widget) end
+    UIManager:forceRePaint()
+    return results, cancelled
+end
+
+-- Sequential fallback for platforms where fork is unavailable. Same
+-- per-item logic; progress via Trapper:info, throttled to one repaint per
+-- BULK_UI_INTERVAL (fast_refresh keeps even those cheap).
+function OPDSBrowser:_bulkFetchSequential(plan)
+    local ka = MakiHTTP.Client:new{
+        base_url = plan[1] and plan[1].url:match("^(https://[^/]+)") or "",
+        username = self.root_catalog_username,
+        password = self.root_catalog_password,
+    }
+    local results = {}
+    local cancelled = false
+    local last_paint_s = 0
+    for i, p in ipairs(plan) do
+        local now_s = time.to_s(time.now())
+        if now_s - last_paint_s >= BULK_UI_INTERVAL then
+            local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, #plan, p.title or ""),
+                                    last_paint_s > 0)
+            if go == false then
+                cancelled = true
+                break
+            end
+            last_paint_s = now_s
+        end
+        local part = p.dir .. "/.maki-part-0"
+        local ok_run, status, name = pcall(self._bulkFetchOne, self, ka, p, part)
+        if not ok_run then status, name = "fail", nil end
+        results[i] = { status = status, name = name }
+    end
+    if ka then ka:close() end
+    return results, cancelled
+end
+
+-- Scan the subtree, plan target folders, then fetch everything in parallel.
+-- Must be called inside Trapper:wrap.
 function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
     local LIMIT = 5000
 
-    -- Scan phase. Trapper:info updates as we descend into each subfeed.
+    -- Scan phase. Repaints are rationed: each Trapper:info is a full e-ink
+    -- repaint plus a 0.1s dismiss-check yield, so never more than one a
+    -- second no matter how fast entries are found.
     Trapper:info(_("Scanning catalog…"))
-    local results = {}
-    local last_label, last_painted = nil, -1
+    local found = {}
+    local last_label, last_painted, last_paint_s = nil, -1, 0
     local function scan_progress(count, where)
-        -- Repaint on folder change, for the first few files (instant
-        -- feedback), then every 10 — e-ink repaints per item would be churn.
-        if where ~= last_label or count <= 2 or count - last_painted >= 10 then
+        local due = (where ~= last_label) or count <= 2 or (count - last_painted >= 10)
+        local now_s = time.to_s(time.now())
+        if due and now_s - last_paint_s >= 1 then
             last_label = where
             last_painted = count
+            last_paint_s = now_s
             return Trapper:info(T(_("Scanning: %1\n%2 file(s) found"), where, count))
         end
         return true
     end
-    self:walkFeedForBulk(start_url, breadcrumb, results, LIMIT, scan_progress)
+    self:walkFeedForBulk(start_url, breadcrumb, found, LIMIT, scan_progress)
 
-    if results._cancelled then
+    if found._cancelled then
         Trapper:reset()
         return
     end
-    if #results == 0 then
+    if #found == 0 then
         Trapper:reset()
         UIManager:show(InfoMessage:new{ text = _("No downloadable files found here.") })
         return
     end
 
-    -- Plan target paths. Learning each file's server-side name takes one
-    -- HEAD request per file; run them over the same keepalive connection the
-    -- downloads will use (one TLS handshake total instead of one per file)
-    -- and narrate progress — this silent stretch was the old "0 file(s)
-    -- found" hang, and on a slow radio it could run into the socket timeout.
-    local ka = MakiHTTP.Client:new{
-        base_url = results[1].url:match("^(https://[^/]+)") or "",
-        username = self.root_catalog_username,
-        password = self.root_catalog_password,
-    }
+    -- Plan target folders. Filenames are resolved per file by the workers
+    -- themselves (one HEAD over their own keepalive connection, immediately
+    -- before the GET) — there is no serial "Preparing" pass any more.
     local plan = {}
-    for idx, r in ipairs(results) do
-        local go = Trapper:info(T(_("Preparing %1 / %2\n%3"), idx, #results, r.title or ""))
-        if go == false then
-            if ka then ka:close() end
-            Trapper:reset()
-            return
-        end
+    for _, r in ipairs(found) do
         local parts = { base_dir }
         for _, c in ipairs(r.breadcrumb) do
             table.insert(parts, c)
         end
-        local target_dir = table.concat(parts, "/"):gsub("//+", "/")
-        local filename
-        local headers = ka and ka:headURL(r.url)
-        if headers then
-            filename = OPDSBrowser.fileNameFromHeaders(headers, r.url, r.filetype)
-        else
-            filename = self:getServerFileName(r.url, r.filetype)
-        end
-        filename = util.getSafeFilename(filename, target_dir)
-        local target_path = util.fixUtf8(target_dir .. "/" .. filename, "_")
         table.insert(plan, {
             url      = r.url,
-            file     = target_path,
-            dir      = target_dir,
+            dir      = table.concat(parts, "/"):gsub("//+", "/"),
             feed     = r.feed,
             title    = r.breadcrumb[#r.breadcrumb],
-            username = self.root_catalog_username,
-            password = self.root_catalog_password,
+            filetype = r.filetype,
         })
     end
 
-    -- Download phase. Sequential, one Trapper:info update per file. Tapping
-    -- the widget pops a confirm-cancel dialog (built into Trapper:info).
-    -- A single keepalive HTTPS connection is reused for every file in the
-    -- run — eliminates the per-file TLS handshake (the slowest thing the
-    -- Kindle radio does).
-    local total = #plan
+    Trapper:reset() -- close the scan dialog; the fetch drives its own widget
+    local results, cancelled = self:_bulkFetchParallel(plan)
+    if not results then
+        results, cancelled = self:_bulkFetchSequential(plan)
+        Trapper:reset()
+    end
+
+    -- Tally + record what each series folder now holds so auto-sync can
+    -- follow it. Skipped files count as present for the marker: the ledger
+    -- should reflect the folder, not just this run's transfers.
     local downloaded, skipped, failed = 0, 0, 0
-    for i, p in ipairs(plan) do
-        local short = p.file:match("[^/]+$") or p.file
-        local go = Trapper:info(T(_("Downloading %1 / %2\n%3"), i, total, short))
-        if go == false then break end
-        util.makePath(p.dir)
-        if lfs.attributes(p.file) then
-            skipped = skipped + 1
-        else
-            local ok = false
-            if ka then
-                ok = ka:downloadURL(p.url, p.file)
-                if ok == nil then
-                    -- Host mismatch (shouldn't happen for a single-catalog
-                    -- bulk download, but fall back just in case).
-                    ok = self:downloadFile(p.file, p.url, p.username, p.password)
-                end
-            else
-                ok = self:downloadFile(p.file, p.url, p.username, p.password)
+    local by_dir = {}
+    for idx, r in pairs(results or {}) do
+        local p = plan[idx]
+        if r.status == "ok" then downloaded = downloaded + 1
+        elseif r.status == "skip" then skipped = skipped + 1
+        else failed = failed + 1 end
+        if p and r.name and (r.status == "ok" or r.status == "skip") then
+            local b = by_dir[p.dir]
+            if not b then
+                b = { feed = p.feed, title = p.title, items = {} }
+                by_dir[p.dir] = b
             end
-            if ok then
-                downloaded = downloaded + 1
-            else
-                failed = failed + 1
-            end
+            b.items[#b.items + 1] = { url = p.url, name = r.name }
         end
     end
-    if ka then ka:close() end
-
-    -- Record what this series folder now holds so auto-sync can follow it.
     local server = self:getCurrentServer()
     if server then
         local now = os.time()
-        local by_dir = {}
-        for _, p in ipairs(plan) do
-            if lfs.attributes(p.file) then
-                local b = by_dir[p.dir]
-                if not b then
-                    b = { feed = p.feed, title = p.title, items = {} }
-                    by_dir[p.dir] = b
-                end
-                b.items[#b.items + 1] = p
-            end
-        end
         for dir, b in pairs(by_dir) do
             local marker = Marker.read(dir) or { fetched = {} }
             marker.catalog = server.url
             marker.feed = b.feed
             marker.title = marker.title or b.title
-            for _, p in ipairs(b.items) do
-                Marker.markFetched(marker, p.url, p.file:match("[^/]+$"), now)
+            for _, it in ipairs(b.items) do
+                Marker.markFetched(marker, it.url, it.name, now)
             end
             local ok, err = Marker.write(dir, marker)
             if not ok then logger.warn("Maki: marker write failed", dir, err) end
         end
     end
 
-    Trapper:reset()
-
     UIManager:show(InfoMessage:new{
-        text = T(_("Maki: bulk download finished.\n%1 downloaded\n%2 already present\n%3 failed\nInto: %4"),
+        text = T(_("Maki: bulk download %1.\n%2 downloaded\n%3 already present\n%4 failed\nInto: %5"),
+                 cancelled and _("cancelled") or _("finished"),
                  downloaded, skipped, failed, base_dir),
         timeout = 6,
     })
