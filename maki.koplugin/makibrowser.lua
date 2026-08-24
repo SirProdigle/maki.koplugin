@@ -539,6 +539,8 @@ local function buildRootEntry(server)
         searchable = server.url and server.url:match("%%s") and true or false,
         sync       = server.sync,
         sync_dir   = server.sync_dir,  -- Add this line
+        home_url   = server.home_url,   -- optional start point (long-press a
+        home_title = server.home_title, -- folder inside → "Set as start point")
         excluded_authors = server.excluded_authors,
         excluded_categories = server.excluded_categories,
         included_authors = server.included_authors,
@@ -1651,6 +1653,23 @@ function OPDSBrowser:onMenuSelect(item)
             connect_callback = function()
                 self:searchCatalog(item.url)
             end
+        elseif #self.paths == 0 and item.home_url then
+            -- A start point is set for this catalog (e.g. the Manga
+            -- library): open it directly instead of the server root feed.
+            -- The root feed is seeded onto the path stack so the up-arrow
+            -- still walks start point → root feed → server list.
+            connect_callback = function()
+                self.paths = { { url = item.url, title = item.text } }
+                self.catalog_title = item.home_title or item.text
+                self:updateCatalog(item.home_url)
+                if #self.paths == 1 then
+                    -- Start point unreachable or empty (library renamed?):
+                    -- fall back to the server root feed.
+                    self.paths = {}
+                    self.catalog_title = item.text
+                    self:updateCatalog(item.url)
+                end
+            end
         else
             self.catalog_title = item.text or self.catalog_title or self.root_catalog_title
             connect_callback = function()
@@ -1731,20 +1750,50 @@ function OPDSBrowser:onMenuHold(item)
     if not item.url then return true end
 
     local dialog
+    local rows = {{
+        {
+            text = _("Download all here"),
+            callback = function()
+                UIManager:close(dialog)
+                NetworkMgr:runWhenConnected(function()
+                    self:downloadAllHere(item)
+                end)
+            end,
+        },
+    }}
+    -- Start point: opening the catalog from the server list jumps straight
+    -- to this feed (e.g. the Manga library) instead of the root feed.
+    local server = self:getCurrentServer()
+    if server then
+        local is_home = server.home_url == item.url
+        rows[#rows + 1] = {
+            {
+                text = is_home and _("Unset as start point")
+                                or _("Set as start point"),
+                callback = function()
+                    UIManager:close(dialog)
+                    if is_home then
+                        server.home_url, server.home_title = nil, nil
+                    else
+                        server.home_url = item.url
+                        server.home_title = item.title or item.text
+                    end
+                    self._manager.updated = true
+                    self._manager:saveSettings()
+                    UIManager:show(Notification:new{
+                        text = is_home
+                            and T(_("'%1' opens at its root feed again."), server.title)
+                            or  T(_("'%1' now opens at '%2'."),
+                                  server.title, item.title or item.text),
+                    })
+                end,
+            },
+        }
+    end
     dialog = ButtonDialog:new{
         title = item.title or item.text,
         title_align = "center",
-        buttons = {{
-            {
-                text = _("Download all here"),
-                callback = function()
-                    UIManager:close(dialog)
-                    NetworkMgr:runWhenConnected(function()
-                        self:downloadAllHere(item)
-                    end)
-                end,
-            },
-        }},
+        buttons = rows,
     }
     UIManager:show(dialog)
     return true
