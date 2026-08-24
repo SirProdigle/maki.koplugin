@@ -1694,22 +1694,32 @@ function OPDSBrowser:onMenuHold(item)
             title = item.text,
             title_align = "center",
             buttons = {
+                -- Both run the ledger-driven sync over every followed series
+                -- (folders bulk-downloaded from this catalog, i.e. carrying
+                -- a .maki.lua marker). "New chapters" fetches anything the
+                -- server has that was never fetched before — forwards or
+                -- backwards — but leaves deliberately deleted chapters
+                -- alone. "Re-fetch all missing" ignores that ledger and
+                -- restores every chapter absent from disk, deleted ones
+                -- included.
                 {
                     {
-                        text = _("Force sync"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            NetworkMgr:runWhenConnected(function()
-                                self._manager:launchSync{ manual = true, server_index = item.idx - 1, ignore_ledger = true }
-                            end)
-                        end,
-                    },
-                    {
-                        text = _("Sync"),
+                        text = _("Get new chapters"),
                         callback = function()
                             UIManager:close(dialog)
                             NetworkMgr:runWhenConnected(function()
                                 self._manager:launchSync{ manual = true, server_index = item.idx - 1 }
+                            end)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Re-fetch all missing chapters"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            NetworkMgr:runWhenConnected(function()
+                                self._manager:launchSync{ manual = true, server_index = item.idx - 1, ignore_ledger = true }
                             end)
                         end,
                     },
