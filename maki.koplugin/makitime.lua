@@ -13,7 +13,9 @@ local floor = math.floor
 -- Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 -- days_from_civil).
 local function days_from_civil(y, m, d)
-    if m <= 2 then y = y - 1 end
+    if m <= 2 then
+        y = y - 1
+    end
     local era = floor(y / 400)
     local yoe = y - era * 400
     local mp = (m + 9) % 12
@@ -62,7 +64,9 @@ function M.parseISO8601(s)
         oh, om = tonumber(oh), tonumber(om)
         if oh > 23 or om > 59 then return nil end
         offset = (oh * 60 + om) * 60
-        if sign == "-" then offset = -offset end
+        if sign == "-" then
+            offset = -offset
+        end
     end
 
     if mo < 1 or mo > 12 or d < 1 or d > days_in_month(y, mo)
@@ -70,9 +74,7 @@ function M.parseISO8601(s)
         return nil
     end
 
-    local epoch = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset
-    if frac ~= 0 then epoch = epoch + frac end
-    return epoch
+    return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset + frac
 end
 
 -- The raw <updated> text of a parsed OPDS entry, or nil. makiparser yields a

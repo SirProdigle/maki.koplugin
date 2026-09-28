@@ -379,6 +379,19 @@ function OPDS:_syncDeps(progress_path)
     return deps
 end
 
+-- Path of the document open in the reader, or nil. The sync child must not
+-- replace it under the reader's feet; it is retried on the next sync.
+function OPDS:_openDocumentPath()
+    local doc = self.ui and self.ui.document
+    if not doc then
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        doc = ok and ReaderUI and ReaderUI.instance and ReaderUI.instance.document or nil
+    end
+    local file = doc and doc.file
+    if not file then return nil end
+    return ffiutil.realpath(file) or file
+end
+
 -- opts: { manual = bool, server_index = n|nil, ignore_ledger = bool }
 function OPDS:launchSync(opts)
     opts = opts or {}
@@ -397,6 +410,9 @@ function OPDS:launchSync(opts)
         os.remove(progress_path)
     end
     local deps = self:_syncDeps(progress_path)
+    -- Captured here, in the parent: the forked child cannot see the reader.
+    deps.openFile = self:_openDocumentPath()
+    deps.realpath = ffiutil.realpath
     local servers, settings = self.servers, self.settings
     local run_opts = { server_index = opts.server_index, ignore_ledger = opts.ignore_ledger }
 
@@ -457,8 +473,9 @@ function OPDS:_pollSync()
                 local chunk = src and load_chunk("return " .. src)
                 local ok, st = pcall(chunk or function() end)
                 if ok and type(st) == "table" and self.sync_widget then
-                    self:_showSyncProgress(T(_("Maki: %1 (%2/%3)\n%4 downloaded — tap to cancel"),
-                        st.title or "", st.series_index or 0, st.series_total or 0, st.downloaded or 0))
+                    self:_showSyncProgress(T(_("Maki: %1 (%2/%3)\n%4 downloaded, %5 updated — tap to cancel"),
+                        st.title or "", st.series_index or 0, st.series_total or 0,
+                        st.downloaded or 0, st.replaced or 0))
                 end
             end
         end
@@ -473,7 +490,7 @@ function OPDS:_pollSync()
         local ok, r = pcall(chunk or function() end)
         if ok and type(r) == "table" then result = r end
     end
-    result = result or { series = {}, downloaded = 0, failed = 0, adopted = 0,
+    result = result or { series = {}, downloaded = 0, replaced = 0, failed = 0, adopted = 0,
                          aborted = true, reason = "no result from child" }
     -- A terminated child never gets to write its result, so the pipe is empty
     -- or truncated. Report it as cancelled (not aborted) so the summary is
@@ -490,7 +507,9 @@ function OPDS:_pollSync()
 end
 
 function OPDS:_finishSync(result, was_manual)
-    logger.info("Maki: sync finished", "downloaded", result.downloaded, "failed", result.failed,
+    result.replaced = result.replaced or 0
+    logger.info("Maki: sync finished", "downloaded", result.downloaded, "replaced", result.replaced,
+                "failed", result.failed,
                 "adopted", result.adopted, "aborted", tostring(result.aborted),
                 "cancelled", tostring(result.cancelled), result.reason or "")
     if not result.aborted and not result.cancelled then
@@ -504,18 +523,23 @@ function OPDS:_finishSync(result, was_manual)
     end
     if was_manual then
         UIManager:show(InfoMessage:new{
-            text = T(_("Maki: %1 downloaded, %2 failed, %3 adopted%4"),
-                     result.downloaded, result.failed, result.adopted,
+            text = T(_("Maki: %1 downloaded, %2 updated, %3 failed, %4 adopted%5"),
+                     result.downloaded, result.replaced, result.failed, result.adopted,
                      result.cancelled and _("\n(cancelled)")
                         or (result.aborted and ("\n" .. tostring(result.reason)) or "")),
             timeout = 6,
         })
+    elseif result.downloaded > 0 and result.replaced > 0 then
+        Notification:notify(T(_("Maki: %1 new chapter(s) in %2 series, %3 updated"),
+                              result.downloaded, series_with_new, result.replaced))
     elseif result.downloaded > 0 then
         Notification:notify(T(_("Maki: %1 new chapter(s) in %2 series"), result.downloaded, series_with_new))
+    elseif result.replaced > 0 then
+        Notification:notify(T(_("Maki: %1 chapter(s) updated"), result.replaced))
     elseif result.aborted then
         logger.warn("Maki: auto-sync aborted:", result.reason)
     end
-    if result.downloaded > 0 then self:_refreshFileManager() end
+    if result.downloaded > 0 or result.replaced > 0 then self:_refreshFileManager() end
 end
 
 function OPDS:_refreshFileManager()

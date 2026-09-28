@@ -58,7 +58,9 @@ local function plan_replace(e, rec, server_updated, dir, deps)
     local path = dir .. "/" .. fname
     if not deps.exists(path) then return nil end -- deleted on purpose: stays gone
     if is_open(path, deps) then return "open" end
-    if deps.exists(path .. ".part") then deps.remove(path .. ".part") end
+    if deps.exists(path .. ".part") then
+        deps.remove(path .. ".part")
+    end
     return { url = e.url, file = fname, path = path, title = e.title or fname,
              updated = server_updated, replace = true }
 end
