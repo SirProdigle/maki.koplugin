@@ -74,7 +74,7 @@ local OPDS = WidgetContainer:extend{
     -- Add default settings with auto-sync enabled
     default_settings = {
         sync_dir = nil,
-        sync_max_dl = 50,
+        sync_max_dl = 0,            -- 0 = no limit
         filetypes = nil,
         -- Auto-sync settings with defaults
         auto_sync = true,           -- Enabled by default

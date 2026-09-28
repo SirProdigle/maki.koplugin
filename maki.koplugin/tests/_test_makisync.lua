@@ -355,6 +355,22 @@ test("runSync: sync_max_dl caps the run", function()
     assert(r.downloaded == 2 and r.capped == true)
 end)
 
+test("runSync: sync_max_dl = 0 means no limit", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2"), acq("u3") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, { sync_max_dl = 0 }, w.deps, {})
+    assert(r.downloaded == 3 and r.capped == false)
+end)
+
+test("runSync: no sync_max_dl setting means no limit", function()
+    local w = world({ feeds = { fs = page({ acq("u1"), acq("u2"), acq("u3") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 3 and r.capped == false)
+end)
+
 test("runSync: consecutive failures abort, ledger progress kept", function()
     local w = world({ feeds = { fs = page({ acq("u1"), acq("u2"), acq("u3"), acq("u4") }) },
                       names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz", u4 = "4.cbz" },

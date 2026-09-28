@@ -2063,16 +2063,16 @@ function OPDSBrowser:downloadDownloadList()
 end
 
 function OPDSBrowser:setMaxSyncDownload()
-    local current_max_dl = self.settings.sync_max_dl or 50
+    local current_max_dl = self.settings.sync_max_dl or 0
     local spin = SpinWidget:new{
         title_text = "Set maximum sync size",
-        info_text = "Set the max number of books to download at a time",
+        info_text = "Set the max number of books to download at a time (0 = no limit)",
         value = current_max_dl,
         value_min = 0,
         value_max = 1000,
         value_step = 10,
         value_hold_step = 50,
-        default_value = 50,
+        default_value = 0,
         wrap = true,
         ok_text = "Save",
         callback = function(spin)

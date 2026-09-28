@@ -300,7 +300,10 @@ function M.runSync(servers, settings, deps, opts)
     opts = opts or {}
     local result = { series = {}, downloaded = 0, replaced = 0, failed = 0, adopted = 0,
                      aborted = false, capped = false, cancelled = false, reason = nil }
-    local state = { max_dl = settings.sync_max_dl or 50, consecutive_failures = 0,
+    -- sync_max_dl: 0 or unset means no limit.
+    local max_dl = settings.sync_max_dl
+    if not max_dl or max_dl <= 0 then max_dl = math.huge end
+    local state = { max_dl = max_dl, consecutive_failures = 0,
                     feeds_ok = 0, series_index = 0, series_total = 0 }
 
     local targets = {}
