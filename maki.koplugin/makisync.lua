@@ -14,18 +14,21 @@
 --   marker                    -> makimarker deps table (optional; default io)
 --   progress(state)           -> nil                     (optional; manual runs only)
 --   cancelled()               -> bool                    (optional)
+--   fileSize(path)            -> bytes | nil             (optional; no replacements without it)
+--   fetchJSON(url, username, password) -> table | nil, err (optional; Komga REST, no replacements without it)
 --   openFile                  -> path of the document open in the reader, or nil
 --                                (optional; captured by the parent before forking)
 --   realpath(path)            -> canonical path | nil    (optional; used to match openFile)
 --
--- Change detection: every entry carries the feed's raw <updated>. A chapter
--- already in the ledger whose file is still on disk is re-downloaded
--- ("replace") when the server timestamp is newer than the ledger's
--- `updated` (or its download time `at` for entries that predate `updated`).
+-- Change detection: file size. For a Komga series feed, one REST call per
+-- series per sync (/api/v1/series/{id}/books) yields every book's
+-- `sizeBytes`. A chapter already in the ledger whose local file is still on
+-- disk is re-downloaded ("replace") when the server size is known and
+-- differs from the local size. OPDS <updated> is NOT usable: Komga bumps it
+-- on every book of a series whenever it rescans that series.
 
 local logger = require("logger")
 local Marker = require("makimarker")
-local Time = require("makitime")
 
 local M = {}
 
@@ -48,34 +51,40 @@ end
 -- A ledger entry whose chapter changed on the server since it was fetched.
 -- Returns a replace plan item, "open" when it is the document being read,
 -- or nil.
-local function plan_replace(e, rec, server_updated, dir, deps)
-    local base = rec.updated or rec.at
-    if not (server_updated and base and server_updated > base) then return nil end
-    -- Seeded entries carry no file name: resolve it only now, so an
-    -- unchanged feed never costs a HEAD per chapter.
-    local fname = rec.file or deps.fileName(e.url, e.filetype)
-    if not fname then return nil end
+local function plan_replace(e, rec, dir, deps, plan)
+    if not e.size or not deps.fileSize then return nil end
+    local fname = rec.file
+    if not fname then
+        -- Seeded entries carry no file name: resolve it once (HEAD), only
+        -- when there is something to compare, and remember it.
+        fname = deps.fileName(e.url, e.filetype)
+        if not fname then return nil end
+        rec.file = fname
+        plan.changed = true
+    end
     local path = dir .. "/" .. fname
     if not deps.exists(path) then return nil end -- deleted on purpose: stays gone
+    local local_size = deps.fileSize(path)
+    if not local_size or local_size == e.size then return nil end
     if is_open(path, deps) then return "open" end
     if deps.exists(path .. ".part") then
         deps.remove(path .. ".part")
     end
     return { url = e.url, file = fname, path = path, title = e.title or fname,
-             updated = server_updated, replace = true }
+             size = e.size, replace = true }
 end
 
 -- Decide what to do for every acquisition entry of one series feed.
+-- `entry.size` (server bytes, optional) drives replacements.
 function M.planSeries(entries, dir, marker, deps)
     dir = strip_slash(dir)
     marker.fetched = marker.fetched or {}
     local plan = { to_fetch = {}, adopted = 0, skipped_open = 0, changed = false }
     for _, e in ipairs(entries) do
         if e.url then
-            local server_updated = Time.parseISO8601(e.updated)
             local rec = marker.fetched[e.url]
             if rec then
-                local r = plan_replace(e, rec, server_updated, dir, deps)
+                local r = plan_replace(e, rec, dir, deps, plan)
                 if r == "open" then
                     logger.info("Maki: not replacing the open document", e.url)
                     plan.skipped_open = plan.skipped_open + 1
@@ -89,14 +98,13 @@ function M.planSeries(entries, dir, marker, deps)
                 else
                     local path = dir .. "/" .. fname
                     if deps.exists(path) then
-                        Marker.markFetched(marker, e.url, fname, deps.now(), server_updated)
+                        Marker.markFetched(marker, e.url, fname, deps.now())
                         plan.adopted = plan.adopted + 1
                         plan.changed = true
                     else
                         if deps.exists(path .. ".part") then deps.remove(path .. ".part") end
                         plan.to_fetch[#plan.to_fetch + 1] = {
                             url = e.url, file = fname, path = path, title = e.title or fname,
-                            updated = server_updated,
                         }
                     end
                 end
@@ -104,6 +112,52 @@ function M.planSeries(entries, dir, marker, deps)
         end
     end
     return plan
+end
+
+-- ── Komga REST (file sizes) ─────────────────────────────────────────────
+
+-- REST url listing every book of the series behind a Komga OPDS series
+-- feed (".../opds/v1.2/series/{id}"), or nil for any other feed. Keeps any
+-- path prefix Komga is served under.
+function M.komgaSeriesBooksUrl(feed_url)
+    if type(feed_url) ~= "string" then return nil end
+    local base, id = feed_url:match("^(https?://.-)/opds/v[%d%.]+/series/([^/?#]+)")
+    if not base then return nil end
+    return base .. "/api/v1/series/" .. id .. "/books?unpaged=true"
+end
+
+-- Komga book id from an OPDS acquisition url (".../opds/v1.2/books/{id}/file/..."), or nil.
+function M.komgaBookId(acq_url)
+    if type(acq_url) ~= "string" then return nil end
+    return acq_url:match("/opds/v[%d%.]+/books/([^/?#]+)/file")
+end
+
+-- { [book_id] = sizeBytes } from a decoded /books response, or nil when the
+-- response does not have the expected shape. Malformed rows are skipped.
+function M.bookSizes(resp)
+    if type(resp) ~= "table" or type(resp.content) ~= "table" then return nil end
+    local sizes = {}
+    for _, b in ipairs(resp.content) do
+        if type(b) == "table" and type(b.id) == "string" and type(b.sizeBytes) == "number" then
+            sizes[b.id] = b.sizeBytes
+        end
+    end
+    return sizes
+end
+
+-- One REST call for a followed series. Any failure means "no size info"
+-- (no replacements for this series), never a failed sync.
+local function fetch_sizes(feed_url, server, deps)
+    if not (deps.fetchJSON and deps.fileSize) then return nil end
+    local url = M.komgaSeriesBooksUrl(feed_url)
+    if not url then return nil end
+    local ok, resp, err = pcall(deps.fetchJSON, url, server.username, server.password)
+    if not ok then resp, err = nil, resp end
+    local sizes = resp and M.bookSizes(resp)
+    if not sizes then
+        logger.warn("Maki: no book sizes for", feed_url, err or "unexpected response")
+    end
+    return sizes
 end
 
 -- Cap automatic runs to one successful run per interval.
@@ -129,8 +183,7 @@ local function collect_entries(feed_url, deps)
                     if a.href and a.type ~= "borrow" then
                         local ft = deps.filetype(a)
                         if ft then
-                            entries[#entries + 1] = { url = a.href, title = item.title or item.text, filetype = ft,
-                                                         updated = item.updated }
+                            entries[#entries + 1] = { url = a.href, title = item.title or item.text, filetype = ft }
                             break
                         end
                     end
@@ -160,11 +213,21 @@ local function sync_one_series(server, followed, deps, opts, result, state)
     if opts.ignore_ledger then
         plan_marker = { fetched = {} }
     end
+    -- Server sizes only matter for chapters already in the ledger.
+    if next(plan_marker.fetched or {}) then
+        local sizes = fetch_sizes(marker.feed, server, deps)
+        if sizes then
+            for _, e in ipairs(entries) do
+                local id = M.komgaBookId(e.url)
+                e.size = id and sizes[id] or nil
+            end
+        end
+    end
     local plan = M.planSeries(entries, dir, plan_marker, deps)
     if opts.ignore_ledger then
         -- adoptions discovered against the empty ledger still belong in the real one
         for url, rec_ in pairs(plan_marker.fetched) do
-            if Marker.markFetched(marker, url, rec_.file, rec_.at, rec_.updated) then plan.changed = true end
+            if Marker.markFetched(marker, url, rec_.file, rec_.at) then plan.changed = true end
         end
     end
     rec.adopted = plan.adopted
@@ -177,6 +240,11 @@ local function sync_one_series(server, followed, deps, opts, result, state)
         if deps.cancelled and deps.cancelled() then result.cancelled = true; break end
         local tmp = item.path .. ".part"
         local ok, why = deps.download(item.url, tmp, server.username, server.password)
+        if ok and item.replace and deps.fileSize(tmp) ~= item.size then
+            -- Truncated, or the server file changed again mid-sync: never
+            -- swap a bad copy over a good one. Retried next sync.
+            ok, why = false, "size mismatch"
+        end
         if ok then
             local rok, rerr = deps.rename(tmp, item.path)
             if not rok then ok, why = false, rerr or "rename failed" end
@@ -185,12 +253,12 @@ local function sync_one_series(server, followed, deps, opts, result, state)
             if item.replace then
                 -- .part renamed over the old file; the .sdr sidecar is left
                 -- alone (same pages, so reading progress stays valid).
-                Marker.markReplaced(marker, item.url, item.file, deps.now(), item.updated)
+                Marker.markReplaced(marker, item.url, item.file, deps.now())
                 plan.changed = true
                 rec.replaced = rec.replaced + 1
                 result.replaced = result.replaced + 1
             else
-                if Marker.markFetched(marker, item.url, item.file, deps.now(), item.updated) then
+                if Marker.markFetched(marker, item.url, item.file, deps.now()) then
                     plan.changed = true
                 end
                 rec.downloaded = rec.downloaded + 1
@@ -201,7 +269,11 @@ local function sync_one_series(server, followed, deps, opts, result, state)
             deps.remove(tmp)
             rec.failed = rec.failed + 1
             result.failed = result.failed + 1
-            state.consecutive_failures = state.consecutive_failures + 1
+            -- A size mismatch is a server-side condition, not a sign the
+            -- network is down: it must not abort the rest of the sync.
+            if why ~= "size mismatch" then
+                state.consecutive_failures = state.consecutive_failures + 1
+            end
             result.reason = result.reason or why
             logger.warn("Maki: download failed", item.path, why)
             if state.consecutive_failures >= M.ABORT_AFTER_CONSECUTIVE_FAILURES then

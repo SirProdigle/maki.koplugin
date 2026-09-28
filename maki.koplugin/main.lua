@@ -338,6 +338,41 @@ function OPDS:_ensureBrowser()
     return self.sync_browser
 end
 
+-- GET + decode JSON with HTTP basic auth (Komga REST). Runs in the sync
+-- child. Returns the decoded table, or nil + reason.
+local function fetchJSON(json_url, username, password)
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local mime = require("mime")
+    local socketutil = require("socketutil")
+    local sink = {}
+    local request = {
+        url     = json_url,
+        method  = "GET",
+        headers = { ["Accept"] = "application/json" },
+        sink    = ltn12.sink.table(sink),
+    }
+    if username then
+        request.headers["Authorization"] = "Basic " .. mime.b64(username .. ":" .. (password or ""))
+    end
+    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    local code = socket.skip(1, http.request(request))
+    socketutil:reset_timeout()
+    if code ~= 200 then return nil, "HTTP " .. tostring(code) end
+    local body = table.concat(sink)
+    local ok_rj, rapidjson = pcall(require, "rapidjson")
+    local ok, parsed
+    if ok_rj then
+        ok, parsed = pcall(rapidjson.decode, body)
+    else
+        local ok_j, json = pcall(require, "json")
+        if not ok_j then return nil, "no JSON decoder" end
+        ok, parsed = pcall(json.decode, body)
+    end
+    if not ok or type(parsed) ~= "table" then return nil, "bad JSON" end
+    return parsed
+end
+
 function OPDS:_syncDeps(progress_path)
     local browser = self:_ensureBrowser()
     local deps = {
@@ -366,6 +401,8 @@ function OPDS:_syncDeps(progress_path)
             browser.root_catalog_title    = srv.title
         end,
         exists = function(p) return lfs.attributes(p) ~= nil end,
+        fileSize = function(p) return lfs.attributes(p, "size") end,
+        fetchJSON = fetchJSON,
         remove = function(p) return os.remove(p) end,
         rename = function(a, b) return os.rename(a, b) end,
         now = os.time,

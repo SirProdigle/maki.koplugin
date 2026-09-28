@@ -20,7 +20,6 @@ local OPDSPSE = require("makipse")
 local MakiHTTP = require("makihttp")
 local MakiBulk = require("makibulk")
 local MakiNames = require("makinames")
-local MakiTime = require("makitime")
 local SpinWidget = require("ui/widget/spinwidget")
 local TextViewer = require("ui/widget/textviewer")
 local Trapper = require("ui/trapper")
@@ -1153,9 +1152,6 @@ function OPDSBrowser:genItemTableFromCatalog(catalog, item_url)
         item.title = title
         item.author = author
         item.content = entry.content or entry.summary
-        -- Raw <updated> (ISO-8601); makisync compares it with the ledger to
-        -- re-fetch chapters that changed on the server.
-        item.updated = MakiTime.entryUpdated(entry)
 
         local current_server
         for _, server in ipairs(self.servers) do
@@ -2198,7 +2194,6 @@ function OPDSBrowser:walkFeedForBulk(item_url, breadcrumb, results, limit, on_pr
                             filetype   = filetype,
                             breadcrumb = breadcrumb,
                             feed       = feed_root,
-                            updated    = item.updated,
                         })
                         -- Tick the counter as items are collected, not just
                         -- once per feed page — otherwise a single-series
@@ -2564,7 +2559,6 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
             feed     = r.feed,
             title    = r.breadcrumb[#r.breadcrumb],
             filetype = r.filetype,
-            updated  = r.updated,
         })
     end
 
@@ -2591,7 +2585,7 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
                 b = { feed = p.feed, title = p.title, items = {} }
                 by_dir[p.dir] = b
             end
-            b.items[#b.items + 1] = { url = p.url, name = r.name, updated = p.updated }
+            b.items[#b.items + 1] = { url = p.url, name = r.name }
         end
     end
     local server = self:getCurrentServer()
@@ -2603,7 +2597,7 @@ function OPDSBrowser:runBulkDownload(start_url, breadcrumb, base_dir)
             marker.feed = b.feed
             marker.title = marker.title or b.title
             for _, it in ipairs(b.items) do
-                Marker.markFetched(marker, it.url, it.name, now, MakiTime.parseISO8601(it.updated))
+                Marker.markFetched(marker, it.url, it.name, now)
             end
             local ok, err = Marker.write(dir, marker)
             if not ok then logger.warn("Maki: marker write failed", dir, err) end

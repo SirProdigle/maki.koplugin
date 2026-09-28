@@ -27,10 +27,12 @@ local function test(name, fn)
 end
 
 -- Build deps over an in-memory disk set and a url→filename map.
+-- disk[path] is `true` (present, size unknown) or a number (present, bytes).
 local function mkdeps(disk, names, log)
     log = log or {}
     return {
-        exists = function(p) return disk[p] == true end,
+        exists = function(p) return disk[p] ~= nil end,
+        fileSize = function(p) return type(disk[p]) == "number" and disk[p] or nil end,
         remove = function(p) disk[p] = nil; log[#log + 1] = "rm " .. p; return true end,
         fileName = function(url, filetype)
             log[#log + 1] = "head " .. url
@@ -40,12 +42,9 @@ local function mkdeps(disk, names, log)
     }, log
 end
 
-local function entry(url, title, updated)
-    return { url = url, title = title or url, filetype = "cbz", updated = updated }
+local function entry(url, title, size)
+    return { url = url, title = title or url, filetype = "cbz", size = size }
 end
-
--- Server <updated> strings with easy epochs: T(60) is 60 seconds after the epoch.
-local function T(secs) return string.format("1970-01-01T00:%02d:%02dZ", math.floor(secs / 60), secs % 60) end
 
 -- ─── planSeries ──────────────────────────────────────────────────────────
 
@@ -111,94 +110,127 @@ end)
 
 local function only(plan) assert(#plan.to_fetch == 1, "#to_fetch=" .. #plan.to_fetch); return plan.to_fetch[1] end
 
-test("planSeries: server newer than recorded `updated` → replace", function()
-    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
-    local marker = { fetched = { u1 = { file = "a.cbz", at = 1000, updated = 50 } } }
-    local f = only(S.planSeries({ entry("u1", "Ch 1", T(60)) }, "/m/S", marker, deps))
+test("planSeries: server size differs from local size → replace", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = 100 }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    local f = only(S.planSeries({ entry("u1", "Ch 1", 150) }, "/m/S", marker, deps))
     assert(f.replace == true and f.url == "u1" and f.file == "a.cbz" and f.path == "/m/S/a.cbz")
-    assert(f.updated == 60 and f.title == "Ch 1")
-end)
-
-test("planSeries: `updated` wins over a later `at`", function()
-    -- device clock ahead of the server must not hide a change
-    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
-    local marker = { fetched = { u1 = { file = "a.cbz", at = 9999, updated = 50 } } }
-    only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
-end)
-
-test("planSeries: legacy entry (no `updated`) compares against `at`", function()
-    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
-    local marker = { fetched = { u1 = { file = "a.cbz", at = 50 } } }
-    assert(only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps)).replace == true)
-    local marker2 = { fetched = { u1 = { file = "a.cbz", at = 70 } } }
-    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker2, deps).to_fetch == 0)
-end)
-
-test("planSeries: equal or older server timestamp → no replace", function()
-    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, {})
-    local marker = { fetched = { u1 = { file = "a.cbz", at = 1, updated = 60 } } }
-    local plan = S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps)
-    assert(#plan.to_fetch == 0 and plan.changed == false)
-    plan = S.planSeries({ entry("u1", nil, T(59)) }, "/m/S", marker, deps)
-    assert(#plan.to_fetch == 0)
+    assert(f.size == 150 and f.title == "Ch 1")
     assert(#log == 0, "no HEAD expected")
 end)
 
-test("planSeries: no or unparseable server timestamp → no replace", function()
-    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+test("planSeries: equal sizes → no replace", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = 100 }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    local plan = S.planSeries({ entry("u1", nil, 100) }, "/m/S", marker, deps)
+    assert(#plan.to_fetch == 0 and plan.changed == false)
+    assert(#log == 0, "no HEAD expected")
+end)
+
+test("planSeries: unknown server size → no replace", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = 100 }, {})
     local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
     assert(#S.planSeries({ entry("u1") }, "/m/S", marker, deps).to_fetch == 0)
-    assert(#S.planSeries({ entry("u1", nil, "garbage") }, "/m/S", marker, deps).to_fetch == 0)
     assert(#log == 0, "no HEAD expected")
+end)
+
+test("planSeries: unreadable local size → no replace", function()
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    assert(#S.planSeries({ entry("u1", nil, 150) }, "/m/S", marker, deps).to_fetch == 0)
 end)
 
 test("planSeries: changed chapter deleted locally is not re-fetched", function()
     local deps = mkdeps({}, { u1 = "a.cbz" })
     local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
-    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps).to_fetch == 0)
+    assert(#S.planSeries({ entry("u1", nil, 150) }, "/m/S", marker, deps).to_fetch == 0)
 end)
 
 test("planSeries: the open document is not replaced", function()
-    local deps = mkdeps({ ["/m/S/a.cbz"] = true, ["/m/S/b.cbz"] = true }, {})
+    local deps = mkdeps({ ["/m/S/a.cbz"] = 100, ["/m/S/b.cbz"] = 100 }, {})
     deps.openFile = "/m/S/a.cbz"
     local marker = { fetched = { u1 = { file = "a.cbz", at = 1 }, u2 = { file = "b.cbz", at = 1 } } }
-    local plan = S.planSeries({ entry("u1", nil, T(60)), entry("u2", nil, T(60)) }, "/m/S", marker, deps)
+    local plan = S.planSeries({ entry("u1", nil, 150), entry("u2", nil, 150) }, "/m/S", marker, deps)
     assert(only(plan).url == "u2")
     assert(plan.skipped_open == 1)
-    assert(marker.fetched.u1.at == 1 and marker.fetched.u1.updated == nil, "ledger untouched → retried next sync")
+    assert(marker.fetched.u1.at == 1, "ledger untouched → retried next sync")
 end)
 
 test("planSeries: open document matched through deps.realpath", function()
-    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local deps = mkdeps({ ["/m/S/a.cbz"] = 100 }, {})
     deps.openFile = "/real/S/a.cbz"
     deps.realpath = function(p) return (p:gsub("^/m/", "/real/")) end
     local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
-    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps).to_fetch == 0)
+    assert(#S.planSeries({ entry("u1", nil, 150) }, "/m/S", marker, deps).to_fetch == 0)
 end)
 
-test("planSeries: seeded entry without a file name derives it via HEAD", function()
-    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, { u1 = "a.cbz" })
+test("planSeries: seeded entry without a file name resolves it once and records it", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = 100 }, { u1 = "a.cbz" })
     local marker = { fetched = { u1 = { at = 1 } } }
-    local f = only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
-    assert(f.replace == true and f.file == "a.cbz" and f.path == "/m/S/a.cbz")
+    local plan = S.planSeries({ entry("u1", nil, 100) }, "/m/S", marker, deps)
+    assert(#plan.to_fetch == 0 and plan.changed == true)
+    assert(marker.fetched.u1.file == "a.cbz" and marker.fetched.u1.at == 1)
     assert(#log == 1 and log[1] == "head u1")
+    local f = only(S.planSeries({ entry("u1", nil, 150) }, "/m/S", marker, deps))
+    assert(f.replace == true and f.path == "/m/S/a.cbz")
+    assert(#log == 1, "file name now comes from the ledger")
+end)
+
+test("planSeries: seeded entry is not resolved when the server size is unknown", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = 100 }, { u1 = "a.cbz" })
+    local marker = { fetched = { u1 = { at = 1 } } }
+    local plan = S.planSeries({ entry("u1") }, "/m/S", marker, deps)
+    assert(#plan.to_fetch == 0 and plan.changed == false and #log == 0)
 end)
 
 test("planSeries: leftover .part of a replace is removed", function()
-    local disk = { ["/m/S/a.cbz"] = true, ["/m/S/a.cbz.part"] = true }
+    local disk = { ["/m/S/a.cbz"] = 100, ["/m/S/a.cbz.part"] = 7 }
     local deps = mkdeps(disk, {})
     local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
-    only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
-    assert(disk["/m/S/a.cbz.part"] == nil and disk["/m/S/a.cbz"] == true)
+    only(S.planSeries({ entry("u1", nil, 150) }, "/m/S", marker, deps))
+    assert(disk["/m/S/a.cbz.part"] == nil and disk["/m/S/a.cbz"] == 100)
 end)
 
-test("planSeries: new downloads and adoptions carry the server timestamp", function()
-    local deps = mkdeps({ ["/m/S/b.cbz"] = true }, { u1 = "a.cbz", u2 = "b.cbz" })
-    local marker = { fetched = {} }
-    local plan = S.planSeries({ entry("u1", nil, T(60)), entry("u2", nil, T(61)) }, "/m/S", marker, deps)
-    local f = only(plan)
-    assert(f.url == "u1" and not f.replace and f.updated == 60)
-    assert(marker.fetched.u2.updated == 61 and marker.fetched.u2.at == 100)
+-- ─── Komga REST helpers ──────────────────────────────────────────────────
+
+test("komgaSeriesBooksUrl: derives the REST url from the OPDS series feed", function()
+    assert(S.komgaSeriesBooksUrl("https://k.x/opds/v1.2/series/0ABC")
+           == "https://k.x/api/v1/series/0ABC/books?unpaged=true")
+    assert(S.komgaSeriesBooksUrl("https://k.x/opds/v1.2/series/0ABC?page=0")
+           == "https://k.x/api/v1/series/0ABC/books?unpaged=true")
+    assert(S.komgaSeriesBooksUrl("https://h/komga/opds/v1.2/series/ID/")
+           == "https://h/komga/api/v1/series/ID/books?unpaged=true")
+end)
+
+test("komgaSeriesBooksUrl: non-Komga feeds yield nil", function()
+    assert(S.komgaSeriesBooksUrl("https://example.org/feeds/opds") == nil)
+    assert(S.komgaSeriesBooksUrl(nil) == nil)
+end)
+
+test("komgaBookId: extracts the book id from an acquisition url", function()
+    assert(S.komgaBookId("https://k.x/opds/v1.2/books/0B1/file/Ch%201.cbz") == "0B1")
+    assert(S.komgaBookId("https://example.org/get/book.epub") == nil)
+    assert(S.komgaBookId(nil) == nil)
+end)
+
+test("bookSizes: maps book id to sizeBytes, skipping malformed rows", function()
+    local sizes = S.bookSizes({ content = {
+        { id = "b1", sizeBytes = 100, name = "x" },
+        { id = "b2", sizeBytes = "junk" },
+        { id = 3, sizeBytes = 5 },
+        { sizeBytes = 9 },
+        "garbage",
+        { id = "b4", sizeBytes = 0 },
+    } })
+    assert(sizes.b1 == 100 and sizes.b4 == 0)
+    assert(sizes.b2 == nil and sizes[3] == nil)
+end)
+
+test("bookSizes: bad shapes yield nil", function()
+    assert(S.bookSizes(nil) == nil)
+    assert(S.bookSizes("x") == nil)
+    assert(S.bookSizes({}) == nil)
+    assert(S.bookSizes({ content = "x" }) == nil)
 end)
 
 -- ─── shouldAutoSync ──────────────────────────────────────────────────────
@@ -254,9 +286,16 @@ local function world(opts)
             log[#log + 1] = "dl " .. url
             log[#log + 1] = "to " .. path
             if fail_urls[url] then return false, "http 500" end
-            files[path] = true; return true
+            files[path] = (opts.dl_sizes or {})[url] or true; return true
         end,
-        exists = function(p) return files[p] == true end,
+        fetchJSON = function(url, username, password)
+            log[#log + 1] = "json " .. url .. " " .. tostring(username) .. ":" .. tostring(password)
+            local r = (opts.rest or {})[url]
+            if r == nil then return nil, "http 404" end
+            return r
+        end,
+        exists = function(p) return files[p] ~= nil end,
+        fileSize = function(p) return type(files[p]) == "number" and files[p] or nil end,
         remove = function(p) files[p] = nil; return true end,
         rename = function(a, b) files[b] = files[a]; files[a] = nil; return true end,
         now = function() return 500 end,
@@ -268,9 +307,7 @@ local function world(opts)
     return { files = files, dirs = dirs, markers = markers, deps = deps, log = log, seed = seed_marker }
 end
 
-local function acq(url, updated)
-    return { url = url, acquisitions = { { href = url, type = "application/zip" } }, title = url, updated = updated }
-end
+local function acq(url) return { url = url, acquisitions = { { href = url, type = "application/zip" } }, title = url } end
 local function page(entries, next_url) local t = entries; t.hrefs = { next = next_url }; return t end
 
 local SERVERS = { { title = "K", url = "C", sync = true, sync_dir = "/m", username = "u", password = "p" } }
@@ -398,41 +435,106 @@ end)
 
 -- ─── runSync: replacements ───────────────────────────────────────────────
 
-test("runSync: changed chapter is re-downloaded over the old file", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)), acq("u2", T(60)) }) },
-                      names = { u1 = "c1.cbz", u2 = "c2.cbz" } })
+-- Komga-shaped URLs: the series feed and acquisition links carry the ids
+-- the REST call and the size map are keyed by.
+local KFEED = "https://k/opds/v1.2/series/S1"
+local KREST = "https://k/api/v1/series/S1/books?unpaged=true"
+local function K(id) return "https://k/opds/v1.2/books/" .. id .. "/file/" .. id .. ".cbz" end
+local function books(t)
+    local content = {}
+    for id, size in pairs(t) do content[#content + 1] = { id = id, sizeBytes = size, name = id } end
+    return { content = content }
+end
+local function count(log, pat)
+    local n = 0
+    for _, l in ipairs(log) do if l:match(pat) then n = n + 1 end end
+    return n
+end
+
+test("runSync: chapter whose size changed is re-downloaded over the old file", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")), acq(K("b2")) }) },
+                      rest = { [KREST] = books({ b1 = 150, b2 = 200 }) },
+                      dl_sizes = { [K("b1")] = 150 } })
     w.dirs["/m"] = { "S" }
-    w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 }, u2 = { file = "c2.cbz", at = 1, updated = 60 } })
-    w.files["/m/S/c1.cbz"] = true; w.files["/m/S/c2.cbz"] = true
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
     w.files["/m/S/c1.sdr"] = true
     local r = S.runSync(SERVERS, { sync_max_dl = 50 }, w.deps, {})
     assert(r.replaced == 1 and r.downloaded == 0 and r.failed == 0, "replaced=" .. tostring(r.replaced))
-    local saw_part = false
-    for _, l in ipairs(w.log) do if l == "to /m/S/c1.cbz.part" then saw_part = true end end
-    assert(saw_part, "must download to .part first")
-    assert(w.files["/m/S/c1.cbz"] and w.files["/m/S/c1.cbz.part"] == nil)
+    assert(count(w.log, "^json ") == 1, "one REST call per series")
+    assert(count(w.log, "^json " .. KREST:gsub("%p", "%%%0") .. " u:p$") == 1, "server credentials used")
+    assert(count(w.log, "^to /m/S/c1%.cbz%.part$") == 1, "must download to .part first")
+    assert(w.files["/m/S/c1.cbz"] == 150 and w.files["/m/S/c1.cbz.part"] == nil)
     assert(w.files["/m/S/c1.sdr"] == true, ".sdr sidecar must be left alone")
     local mk = dofile_string(w.markers["/m/S/.maki.lua"])
-    assert(mk.fetched.u1.at == 500 and mk.fetched.u1.updated == 60 and mk.fetched.u1.file == "c1.cbz")
-    assert(mk.fetched.u2.at == 1, "unchanged chapter untouched")
+    assert(mk.fetched[K("b1")].at == 500 and mk.fetched[K("b1")].file == "c1.cbz")
+    assert(mk.fetched[K("b2")].at == 1, "unchanged chapter untouched")
     assert(#r.series == 1 and r.series[1].replaced == 1 and r.series[1].downloaded == 0)
+    -- the replacement now matches the server: a second run is a no-op
+    local r2 = S.runSync(SERVERS, { sync_max_dl = 50 }, w.deps, {})
+    assert(r2.replaced == 0 and r2.downloaded == 0)
 end)
 
-test("runSync: new chapters record the server timestamp", function()
-    local w = world({ feeds = { fs = page({ acq("u1", "1970-01-01T01:00:00+01:00") }) }, names = { u1 = "c1.cbz" } })
-    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+test("runSync: equal sizes → nothing downloaded, ledger not rewritten", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = books({ b1 = 100 }) } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
     local r = S.runSync(SERVERS, {}, w.deps, {})
-    assert(r.downloaded == 1 and r.replaced == 0)
-    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
-    assert(mk.fetched.u1.updated == 0 and mk.fetched.u1.at == 500)
+    assert(r.replaced == 0 and r.downloaded == 0)
+    assert(count(w.log, "^mwrite") == 0 and count(w.log, "^dl ") == 0)
+end)
+
+test("runSync: REST failure → no replacements, sync carries on", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")), acq(K("b2")) }) },
+                      names = { [K("b2")] = "c2.cbz" } }) -- no REST answer → 404
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.downloaded == 1 and r.aborted == false and r.failed == 0)
+    assert(count(w.log, "^json ") == 1)
+end)
+
+test("runSync: malformed REST JSON → no replacements", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = { content = "nope" } } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.aborted == false)
+end)
+
+test("runSync: fetchJSON throwing → no replacements, sync carries on", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) } })
+    w.deps.fetchJSON = function() error("boom") end
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.aborted == false)
+end)
+
+test("runSync: non-Komga feed → no REST call", function()
+    local w = world({ feeds = { fs = page({ acq("u1") }) } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and count(w.log, "^json ") == 0)
+end)
+
+test("runSync: empty ledger → no REST call", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, names = { [K("b1")] = "c1.cbz" },
+                      rest = { [KREST] = books({ b1 = 100 }) } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED)
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and count(w.log, "^json ") == 0)
 end)
 
 test("runSync: replacements count against sync_max_dl", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)), acq("u2", T(60)), acq("u3", T(60)) }) },
-                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")), acq(K("b2")), acq(K("b3")) }) },
+                      names = { [K("b3")] = "3.cbz" },
+                      rest = { [KREST] = books({ b1 = 150, b2 = 150, b3 = 150 }) },
+                      dl_sizes = { [K("b1")] = 150, [K("b2")] = 150, [K("b3")] = 150 } })
     w.dirs["/m"] = { "S" }
-    w.seed("/m/S", "C", "fs", { u1 = { file = "1.cbz", at = 1 }, u2 = { file = "2.cbz", at = 1 } })
-    w.files["/m/S/1.cbz"] = true; w.files["/m/S/2.cbz"] = true
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "1.cbz", at = 1 }, [K("b2")] = { file = "2.cbz", at = 1 } })
+    w.files["/m/S/1.cbz"] = 100; w.files["/m/S/2.cbz"] = 100
     local r = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
     assert(r.replaced == 2 and r.downloaded == 0 and r.capped == true,
            "replaced=" .. r.replaced .. " downloaded=" .. r.downloaded)
@@ -441,54 +543,81 @@ test("runSync: replacements count against sync_max_dl", function()
 end)
 
 test("runSync: cap spans series for mixed downloads and replacements", function()
-    local w = world({ feeds = { fa = page({ acq("u1", T(60)) }), fb = page({ acq("u2"), acq("u3") }) },
-                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }), fb = page({ acq("u2"), acq("u3") }) },
+                      names = { u2 = "2.cbz", u3 = "3.cbz" },
+                      rest = { [KREST] = books({ b1 = 150 }) }, dl_sizes = { [K("b1")] = 150 } })
     w.dirs["/m"] = { "A", "B" }
-    w.seed("/m/A", "C", "fa", { u1 = { file = "1.cbz", at = 1 } }); w.files["/m/A/1.cbz"] = true
+    w.seed("/m/A", "C", KFEED, { [K("b1")] = { file = "1.cbz", at = 1 } }); w.files["/m/A/1.cbz"] = 100
     w.seed("/m/B", "C", "fb")
     local r = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
     assert(r.replaced == 1 and r.downloaded == 1 and r.capped == true)
 end)
 
 test("runSync: the open document is skipped and retried next sync", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
-    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
-    w.files["/m/S/c1.cbz"] = true
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = books({ b1 = 150 }) },
+                      dl_sizes = { [K("b1")] = 150 } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
     w.deps.openFile = "/m/S/c1.cbz"
     local r = S.runSync(SERVERS, {}, w.deps, {})
     assert(r.replaced == 0 and r.downloaded == 0)
-    for _, l in ipairs(w.log) do assert(not l:match("^dl"), "open document must not be downloaded") end
-    for _, l in ipairs(w.log) do assert(not l:match("^mwrite"), "ledger must not change") end
+    assert(count(w.log, "^dl ") == 0, "open document must not be downloaded")
+    assert(count(w.log, "^mwrite") == 0, "ledger must not change")
     w.deps.openFile = nil
     local r2 = S.runSync(SERVERS, {}, w.deps, {})
     assert(r2.replaced == 1)
 end)
 
 test("runSync: failed replace keeps the old file and the old ledger entry", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" },
-                      fail_urls = { u1 = true } })
-    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
-    w.files["/m/S/c1.cbz"] = true
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = books({ b1 = 150 }) },
+                      fail_urls = { [K("b1")] = true } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
     local r = S.runSync(SERVERS, {}, w.deps, {})
     assert(r.replaced == 0 and r.failed == 1)
-    assert(w.files["/m/S/c1.cbz"] == true, "original must survive")
+    assert(w.files["/m/S/c1.cbz"] == 100, "original must survive")
+    assert(w.files["/m/S/c1.cbz.part"] == nil)
     local mk = dofile_string(w.markers["/m/S/.maki.lua"])
-    assert(mk.fetched.u1.at == 1 and mk.fetched.u1.updated == nil)
+    assert(mk.fetched[K("b1")].at == 1)
 end)
 
-test("runSync: ignore_ledger does not double up replacements", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
-    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
-    w.files["/m/S/c1.cbz"] = true
+test("runSync: a replacement of the wrong size is discarded, original kept", function()
+    -- truncated transfer, or the server file changed again mid-sync
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = books({ b1 = 150 }) },
+                      dl_sizes = { [K("b1")] = 42 } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.failed == 1)
+    assert(w.files["/m/S/c1.cbz"] == 100 and w.files["/m/S/c1.cbz.part"] == nil)
+end)
+
+test("runSync: size mismatches do not abort the sync", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")), acq(K("b2")), acq(K("b3")) }) },
+                      names = { [K("b3")] = "3.cbz" },
+                      rest = { [KREST] = books({ b1 = 150, b2 = 150 }) },
+                      dl_sizes = { [K("b1")] = 42, [K("b2")] = 42 } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "1.cbz", at = 1 }, [K("b2")] = { file = "2.cbz", at = 1 } })
+    w.files["/m/S/1.cbz"] = 100; w.files["/m/S/2.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.failed == 2 and r.aborted == false and r.downloaded == 1)
+end)
+
+test("runSync: ignore_ledger → no REST call, no replacements", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, names = { [K("b1")] = "c1.cbz" },
+                      rest = { [KREST] = books({ b1 = 150 }) } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
     local r = S.runSync(SERVERS, {}, w.deps, { ignore_ledger = true })
-    -- against an empty ledger the present file is adopted, not replaced
-    assert(r.replaced == 0 and r.downloaded == 0)
+    assert(r.replaced == 0 and r.downloaded == 0 and count(w.log, "^json ") == 0)
 end)
 
 test("runSync: progress reports replacements", function()
-    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
-    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
-    w.files["/m/S/c1.cbz"] = true
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b1")) }) }, rest = { [KREST] = books({ b1 = 150 }) },
+                      dl_sizes = { [K("b1")] = 150 } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
     local seen
     w.deps.progress = function(st) seen = st end
     S.runSync(SERVERS, {}, w.deps, {})
