@@ -40,7 +40,12 @@ local function mkdeps(disk, names, log)
     }, log
 end
 
-local function entry(url, title) return { url = url, title = title or url, filetype = "cbz" } end
+local function entry(url, title, updated)
+    return { url = url, title = title or url, filetype = "cbz", updated = updated }
+end
+
+-- Server <updated> strings with easy epochs: T(60) is 60 seconds after the epoch.
+local function T(secs) return string.format("1970-01-01T00:%02d:%02dZ", math.floor(secs / 60), secs % 60) end
 
 -- ─── planSeries ──────────────────────────────────────────────────────────
 
@@ -102,6 +107,100 @@ test("planSeries: mixed feed — new, gap, deleted, present", function()
     assert(#log == 3, "HEAD only for u2,u3,u4; got " .. #log)
 end)
 
+-- ─── planSeries: change detection (replace) ──────────────────────────────
+
+local function only(plan) assert(#plan.to_fetch == 1, "#to_fetch=" .. #plan.to_fetch); return plan.to_fetch[1] end
+
+test("planSeries: server newer than recorded `updated` → replace", function()
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1000, updated = 50 } } }
+    local f = only(S.planSeries({ entry("u1", "Ch 1", T(60)) }, "/m/S", marker, deps))
+    assert(f.replace == true and f.url == "u1" and f.file == "a.cbz" and f.path == "/m/S/a.cbz")
+    assert(f.updated == 60 and f.title == "Ch 1")
+end)
+
+test("planSeries: `updated` wins over a later `at`", function()
+    -- device clock ahead of the server must not hide a change
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 9999, updated = 50 } } }
+    only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
+end)
+
+test("planSeries: legacy entry (no `updated`) compares against `at`", function()
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 50 } } }
+    assert(only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps)).replace == true)
+    local marker2 = { fetched = { u1 = { file = "a.cbz", at = 70 } } }
+    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker2, deps).to_fetch == 0)
+end)
+
+test("planSeries: equal or older server timestamp → no replace", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1, updated = 60 } } }
+    local plan = S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps)
+    assert(#plan.to_fetch == 0 and plan.changed == false)
+    plan = S.planSeries({ entry("u1", nil, T(59)) }, "/m/S", marker, deps)
+    assert(#plan.to_fetch == 0)
+    assert(#log == 0, "no HEAD expected")
+end)
+
+test("planSeries: no or unparseable server timestamp → no replace", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    assert(#S.planSeries({ entry("u1") }, "/m/S", marker, deps).to_fetch == 0)
+    assert(#S.planSeries({ entry("u1", nil, "garbage") }, "/m/S", marker, deps).to_fetch == 0)
+    assert(#log == 0, "no HEAD expected")
+end)
+
+test("planSeries: changed chapter deleted locally is not re-fetched", function()
+    local deps = mkdeps({}, { u1 = "a.cbz" })
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps).to_fetch == 0)
+end)
+
+test("planSeries: the open document is not replaced", function()
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true, ["/m/S/b.cbz"] = true }, {})
+    deps.openFile = "/m/S/a.cbz"
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 }, u2 = { file = "b.cbz", at = 1 } } }
+    local plan = S.planSeries({ entry("u1", nil, T(60)), entry("u2", nil, T(60)) }, "/m/S", marker, deps)
+    assert(only(plan).url == "u2")
+    assert(plan.skipped_open == 1)
+    assert(marker.fetched.u1.at == 1 and marker.fetched.u1.updated == nil, "ledger untouched → retried next sync")
+end)
+
+test("planSeries: open document matched through deps.realpath", function()
+    local deps = mkdeps({ ["/m/S/a.cbz"] = true }, {})
+    deps.openFile = "/real/S/a.cbz"
+    deps.realpath = function(p) return (p:gsub("^/m/", "/real/")) end
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    assert(#S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps).to_fetch == 0)
+end)
+
+test("planSeries: seeded entry without a file name derives it via HEAD", function()
+    local deps, log = mkdeps({ ["/m/S/a.cbz"] = true }, { u1 = "a.cbz" })
+    local marker = { fetched = { u1 = { at = 1 } } }
+    local f = only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
+    assert(f.replace == true and f.file == "a.cbz" and f.path == "/m/S/a.cbz")
+    assert(#log == 1 and log[1] == "head u1")
+end)
+
+test("planSeries: leftover .part of a replace is removed", function()
+    local disk = { ["/m/S/a.cbz"] = true, ["/m/S/a.cbz.part"] = true }
+    local deps = mkdeps(disk, {})
+    local marker = { fetched = { u1 = { file = "a.cbz", at = 1 } } }
+    only(S.planSeries({ entry("u1", nil, T(60)) }, "/m/S", marker, deps))
+    assert(disk["/m/S/a.cbz.part"] == nil and disk["/m/S/a.cbz"] == true)
+end)
+
+test("planSeries: new downloads and adoptions carry the server timestamp", function()
+    local deps = mkdeps({ ["/m/S/b.cbz"] = true }, { u1 = "a.cbz", u2 = "b.cbz" })
+    local marker = { fetched = {} }
+    local plan = S.planSeries({ entry("u1", nil, T(60)), entry("u2", nil, T(61)) }, "/m/S", marker, deps)
+    local f = only(plan)
+    assert(f.url == "u1" and not f.replace and f.updated == 60)
+    assert(marker.fetched.u2.updated == 61 and marker.fetched.u2.at == 100)
+end)
+
 -- ─── shouldAutoSync ──────────────────────────────────────────────────────
 
 test("shouldAutoSync: never synced → true", function()
@@ -153,6 +252,7 @@ local function world(opts)
         filetype = function(acq) return acq.type ~= "borrow" and "cbz" or nil end,
         download = function(url, path)
             log[#log + 1] = "dl " .. url
+            log[#log + 1] = "to " .. path
             if fail_urls[url] then return false, "http 500" end
             files[path] = true; return true
         end,
@@ -168,7 +268,9 @@ local function world(opts)
     return { files = files, dirs = dirs, markers = markers, deps = deps, log = log, seed = seed_marker }
 end
 
-local function acq(url) return { url = url, acquisitions = { { href = url, type = "application/zip" } }, title = url } end
+local function acq(url, updated)
+    return { url = url, acquisitions = { { href = url, type = "application/zip" } }, title = url, updated = updated }
+end
 local function page(entries, next_url) local t = entries; t.hrefs = { next = next_url }; return t end
 
 local SERVERS = { { title = "K", url = "C", sync = true, sync_dir = "/m", username = "u", password = "p" } }
@@ -292,6 +394,105 @@ test("runSync: progress callback and cancel", function()
     local r = S.runSync(SERVERS, {}, w.deps, {})
     assert(r.downloaded == 1 and r.cancelled == true)
     assert(seen[1] == 1)
+end)
+
+-- ─── runSync: replacements ───────────────────────────────────────────────
+
+test("runSync: changed chapter is re-downloaded over the old file", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)), acq("u2", T(60)) }) },
+                      names = { u1 = "c1.cbz", u2 = "c2.cbz" } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 }, u2 = { file = "c2.cbz", at = 1, updated = 60 } })
+    w.files["/m/S/c1.cbz"] = true; w.files["/m/S/c2.cbz"] = true
+    w.files["/m/S/c1.sdr"] = true
+    local r = S.runSync(SERVERS, { sync_max_dl = 50 }, w.deps, {})
+    assert(r.replaced == 1 and r.downloaded == 0 and r.failed == 0, "replaced=" .. tostring(r.replaced))
+    local saw_part = false
+    for _, l in ipairs(w.log) do if l == "to /m/S/c1.cbz.part" then saw_part = true end end
+    assert(saw_part, "must download to .part first")
+    assert(w.files["/m/S/c1.cbz"] and w.files["/m/S/c1.cbz.part"] == nil)
+    assert(w.files["/m/S/c1.sdr"] == true, ".sdr sidecar must be left alone")
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched.u1.at == 500 and mk.fetched.u1.updated == 60 and mk.fetched.u1.file == "c1.cbz")
+    assert(mk.fetched.u2.at == 1, "unchanged chapter untouched")
+    assert(#r.series == 1 and r.series[1].replaced == 1 and r.series[1].downloaded == 0)
+end)
+
+test("runSync: new chapters record the server timestamp", function()
+    local w = world({ feeds = { fs = page({ acq("u1", "1970-01-01T01:00:00+01:00") }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs")
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and r.replaced == 0)
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched.u1.updated == 0 and mk.fetched.u1.at == 500)
+end)
+
+test("runSync: replacements count against sync_max_dl", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)), acq("u2", T(60)), acq("u3", T(60)) }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", "fs", { u1 = { file = "1.cbz", at = 1 }, u2 = { file = "2.cbz", at = 1 } })
+    w.files["/m/S/1.cbz"] = true; w.files["/m/S/2.cbz"] = true
+    local r = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
+    assert(r.replaced == 2 and r.downloaded == 0 and r.capped == true,
+           "replaced=" .. r.replaced .. " downloaded=" .. r.downloaded)
+    local r2 = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
+    assert(r2.replaced == 0 and r2.downloaded == 1 and not r2.capped, "next run picks up the rest")
+end)
+
+test("runSync: cap spans series for mixed downloads and replacements", function()
+    local w = world({ feeds = { fa = page({ acq("u1", T(60)) }), fb = page({ acq("u2"), acq("u3") }) },
+                      names = { u1 = "1.cbz", u2 = "2.cbz", u3 = "3.cbz" } })
+    w.dirs["/m"] = { "A", "B" }
+    w.seed("/m/A", "C", "fa", { u1 = { file = "1.cbz", at = 1 } }); w.files["/m/A/1.cbz"] = true
+    w.seed("/m/B", "C", "fb")
+    local r = S.runSync(SERVERS, { sync_max_dl = 2 }, w.deps, {})
+    assert(r.replaced == 1 and r.downloaded == 1 and r.capped == true)
+end)
+
+test("runSync: the open document is skipped and retried next sync", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = true
+    w.deps.openFile = "/m/S/c1.cbz"
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.downloaded == 0)
+    for _, l in ipairs(w.log) do assert(not l:match("^dl"), "open document must not be downloaded") end
+    for _, l in ipairs(w.log) do assert(not l:match("^mwrite"), "ledger must not change") end
+    w.deps.openFile = nil
+    local r2 = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r2.replaced == 1)
+end)
+
+test("runSync: failed replace keeps the old file and the old ledger entry", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" },
+                      fail_urls = { u1 = true } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = true
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.replaced == 0 and r.failed == 1)
+    assert(w.files["/m/S/c1.cbz"] == true, "original must survive")
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched.u1.at == 1 and mk.fetched.u1.updated == nil)
+end)
+
+test("runSync: ignore_ledger does not double up replacements", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = true
+    local r = S.runSync(SERVERS, {}, w.deps, { ignore_ledger = true })
+    -- against an empty ledger the present file is adopted, not replaced
+    assert(r.replaced == 0 and r.downloaded == 0)
+end)
+
+test("runSync: progress reports replacements", function()
+    local w = world({ feeds = { fs = page({ acq("u1", T(60)) }) }, names = { u1 = "c1.cbz" } })
+    w.dirs["/m"] = { "S" }; w.seed("/m/S", "C", "fs", { u1 = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = true
+    local seen
+    w.deps.progress = function(st) seen = st end
+    S.runSync(SERVERS, {}, w.deps, {})
+    assert(seen and seen.replaced == 1 and seen.downloaded == 0)
 end)
 
 print(string.format("%d/%d tests passed", pass, pass + fail))

@@ -14,9 +14,18 @@
 --   marker                    -> makimarker deps table (optional; default io)
 --   progress(state)           -> nil                     (optional; manual runs only)
 --   cancelled()               -> bool                    (optional)
+--   openFile                  -> path of the document open in the reader, or nil
+--                                (optional; captured by the parent before forking)
+--   realpath(path)            -> canonical path | nil    (optional; used to match openFile)
+--
+-- Change detection: every entry carries the feed's raw <updated>. A chapter
+-- already in the ledger whose file is still on disk is re-downloaded
+-- ("replace") when the server timestamp is newer than the ledger's
+-- `updated` (or its download time `at` for entries that predate `updated`).
 
 local logger = require("logger")
 local Marker = require("makimarker")
+local Time = require("makitime")
 
 local M = {}
 
@@ -25,27 +34,67 @@ M.ABORT_AFTER_CONSECUTIVE_FAILURES = 2
 
 local function strip_slash(p) return (p:gsub("/+$", "")) end
 
+local function is_open(path, deps)
+    local open = deps.openFile
+    if not open then return false end
+    if path == open then return true end
+    if deps.realpath then
+        local ok, real = pcall(deps.realpath, path)
+        if ok and real and real == open then return true end
+    end
+    return false
+end
+
+-- A ledger entry whose chapter changed on the server since it was fetched.
+-- Returns a replace plan item, "open" when it is the document being read,
+-- or nil.
+local function plan_replace(e, rec, server_updated, dir, deps)
+    local base = rec.updated or rec.at
+    if not (server_updated and base and server_updated > base) then return nil end
+    -- Seeded entries carry no file name: resolve it only now, so an
+    -- unchanged feed never costs a HEAD per chapter.
+    local fname = rec.file or deps.fileName(e.url, e.filetype)
+    if not fname then return nil end
+    local path = dir .. "/" .. fname
+    if not deps.exists(path) then return nil end -- deleted on purpose: stays gone
+    if is_open(path, deps) then return "open" end
+    if deps.exists(path .. ".part") then deps.remove(path .. ".part") end
+    return { url = e.url, file = fname, path = path, title = e.title or fname,
+             updated = server_updated, replace = true }
+end
+
 -- Decide what to do for every acquisition entry of one series feed.
 function M.planSeries(entries, dir, marker, deps)
     dir = strip_slash(dir)
     marker.fetched = marker.fetched or {}
-    local plan = { to_fetch = {}, adopted = 0, changed = false }
+    local plan = { to_fetch = {}, adopted = 0, skipped_open = 0, changed = false }
     for _, e in ipairs(entries) do
         if e.url then
-            if not marker.fetched[e.url] then
+            local server_updated = Time.parseISO8601(e.updated)
+            local rec = marker.fetched[e.url]
+            if rec then
+                local r = plan_replace(e, rec, server_updated, dir, deps)
+                if r == "open" then
+                    logger.info("Maki: not replacing the open document", e.url)
+                    plan.skipped_open = plan.skipped_open + 1
+                elseif r then
+                    plan.to_fetch[#plan.to_fetch + 1] = r
+                end
+            else
                 local fname = deps.fileName(e.url, e.filetype)
                 if not fname then
                     logger.warn("Maki: could not derive filename for", e.url)
                 else
                     local path = dir .. "/" .. fname
                     if deps.exists(path) then
-                        Marker.markFetched(marker, e.url, fname, deps.now())
+                        Marker.markFetched(marker, e.url, fname, deps.now(), server_updated)
                         plan.adopted = plan.adopted + 1
                         plan.changed = true
                     else
                         if deps.exists(path .. ".part") then deps.remove(path .. ".part") end
                         plan.to_fetch[#plan.to_fetch + 1] = {
                             url = e.url, file = fname, path = path, title = e.title or fname,
+                            updated = server_updated,
                         }
                     end
                 end
@@ -78,7 +127,8 @@ local function collect_entries(feed_url, deps)
                     if a.href and a.type ~= "borrow" then
                         local ft = deps.filetype(a)
                         if ft then
-                            entries[#entries + 1] = { url = a.href, title = item.title or item.text, filetype = ft }
+                            entries[#entries + 1] = { url = a.href, title = item.title or item.text, filetype = ft,
+                                                         updated = item.updated }
                             break
                         end
                     end
@@ -93,7 +143,7 @@ end
 local function sync_one_series(server, followed, deps, opts, result, state)
     local marker, dir = followed.marker, followed.dir
     local rec = { title = marker.title or dir:match("[^/]+$"), dir = dir,
-                  downloaded = 0, failed = 0, adopted = 0, feed_failed = false }
+                  downloaded = 0, replaced = 0, failed = 0, adopted = 0, feed_failed = false }
     result.series[#result.series + 1] = rec
 
     local entries, err = collect_entries(marker.feed, deps)
@@ -112,14 +162,16 @@ local function sync_one_series(server, followed, deps, opts, result, state)
     if opts.ignore_ledger then
         -- adoptions discovered against the empty ledger still belong in the real one
         for url, rec_ in pairs(plan_marker.fetched) do
-            if Marker.markFetched(marker, url, rec_.file, rec_.at) then plan.changed = true end
+            if Marker.markFetched(marker, url, rec_.file, rec_.at, rec_.updated) then plan.changed = true end
         end
     end
     rec.adopted = plan.adopted
     result.adopted = result.adopted + plan.adopted
 
     for _, item in ipairs(plan.to_fetch) do
-        if result.downloaded >= state.max_dl then result.capped = true; break end
+        -- Replacements share the per-run cap with new chapters, so a large
+        -- server-side refresh spreads across several syncs.
+        if result.downloaded + result.replaced >= state.max_dl then result.capped = true; break end
         if deps.cancelled and deps.cancelled() then result.cancelled = true; break end
         local tmp = item.path .. ".part"
         local ok, why = deps.download(item.url, tmp, server.username, server.password)
@@ -128,9 +180,20 @@ local function sync_one_series(server, followed, deps, opts, result, state)
             if not rok then ok, why = false, rerr or "rename failed" end
         end
         if ok then
-            if Marker.markFetched(marker, item.url, item.file, deps.now()) then plan.changed = true end
-            rec.downloaded = rec.downloaded + 1
-            result.downloaded = result.downloaded + 1
+            if item.replace then
+                -- .part renamed over the old file; the .sdr sidecar is left
+                -- alone (same pages, so reading progress stays valid).
+                Marker.markReplaced(marker, item.url, item.file, deps.now(), item.updated)
+                plan.changed = true
+                rec.replaced = rec.replaced + 1
+                result.replaced = result.replaced + 1
+            else
+                if Marker.markFetched(marker, item.url, item.file, deps.now(), item.updated) then
+                    plan.changed = true
+                end
+                rec.downloaded = rec.downloaded + 1
+                result.downloaded = result.downloaded + 1
+            end
             state.consecutive_failures = 0
         else
             deps.remove(tmp)
@@ -146,7 +209,8 @@ local function sync_one_series(server, followed, deps, opts, result, state)
         end
         if deps.progress then
             deps.progress({ series_index = state.series_index, series_total = state.series_total,
-                            title = rec.title, downloaded = result.downloaded, total_planned = #plan.to_fetch })
+                            title = rec.title, downloaded = result.downloaded, replaced = result.replaced,
+                            total_planned = #plan.to_fetch })
         end
     end
 
@@ -160,7 +224,7 @@ end
 -- opts: { server_index = n|nil, ignore_ledger = bool }
 function M.runSync(servers, settings, deps, opts)
     opts = opts or {}
-    local result = { series = {}, downloaded = 0, failed = 0, adopted = 0,
+    local result = { series = {}, downloaded = 0, replaced = 0, failed = 0, adopted = 0,
                      aborted = false, capped = false, cancelled = false, reason = nil }
     local state = { max_dl = settings.sync_max_dl or 50, consecutive_failures = 0,
                     feeds_ok = 0, series_index = 0, series_total = 0 }
@@ -196,9 +260,10 @@ function M.runSync(servers, settings, deps, opts)
     -- did something are worth reporting; the totals carry the rest.
     local reported = {}
     for _, rec in ipairs(result.series) do
-        if rec.downloaded > 0 or rec.failed > 0 or rec.feed_failed then
+        if rec.downloaded > 0 or rec.replaced > 0 or rec.failed > 0 or rec.feed_failed then
             reported[#reported + 1] = { title = rec.title, downloaded = rec.downloaded,
-                                        failed = rec.failed, feed_failed = rec.feed_failed or nil }
+                                        replaced = rec.replaced, failed = rec.failed,
+                                        feed_failed = rec.feed_failed or nil }
         end
     end
     result.series = reported

@@ -1,11 +1,15 @@
 -- makimarker.lua
 -- The `.maki.lua` per-series marker file: a lenient reader, an atomic
 -- writer, a helper to list followed series directories for one catalog
--- URL, and `markFetched` which never overwrites an existing ledger entry.
+-- URL, `markFetched` which never overwrites an existing ledger entry, and
+-- `markReplaced` which refreshes one after a changed chapter was re-fetched.
 --
 -- Marker shape:
 --   { catalog = <server url>, feed = <series feed url>, title = <string>,
---     fetched = { [acquisition_url] = { file = <string|nil>, at = <number> }, ... } }
+--     fetched = { [acquisition_url] = { file = <string|nil>, at = <number>,
+--                                       updated = <number|nil> }, ... } }
+-- `at` is the local download time; `updated` is the server's OPDS <updated>
+-- (UTC epoch) at download time, nil for entries recorded before it existed.
 --
 -- Every side effect goes through an optional `deps` table so the same code
 -- runs in unit tests, in the forked child and in the seed tool:
@@ -125,12 +129,24 @@ function M.listFollowed(dir, catalog_url, deps, max_depth)
 end
 
 -- Record a fetched acquisition URL. Never overwrites an existing entry.
-function M.markFetched(marker, url, file, at)
+function M.markFetched(marker, url, file, at, updated)
     marker.fetched = marker.fetched or {}
     if marker.fetched[url] then
         return false
     end
-    marker.fetched[url] = { file = file, at = at }
+    marker.fetched[url] = { file = file, at = at, updated = updated }
+    return true
+end
+
+-- Refresh the entry for a chapter that was re-downloaded because the server
+-- copy changed. Only call after the replacement landed on disk.
+function M.markReplaced(marker, url, file, at, updated)
+    marker.fetched = marker.fetched or {}
+    local rec = marker.fetched[url] or {}
+    rec.file = file or rec.file
+    rec.at = at
+    rec.updated = updated
+    marker.fetched[url] = rec
     return true
 end
 

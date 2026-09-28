@@ -246,5 +246,56 @@ test("markFetched: creates `fetched` when absent", function()
     assert(marker.fetched.u1.file == "1.cbz")
 end)
 
+test("markFetched: stores the server `updated` epoch when given", function()
+    local marker = { fetched = {} }
+    assert(Marker.markFetched(marker, "u1", "1.cbz", 100, 90) == true)
+    assert(marker.fetched.u1.at == 100 and marker.fetched.u1.updated == 90)
+end)
+
+test("markFetched: `updated` stays nil when unknown", function()
+    local marker = { fetched = {} }
+    Marker.markFetched(marker, "u1", "1.cbz", 100)
+    assert(marker.fetched.u1.updated == nil)
+end)
+
+test("markFetched: does not overwrite `updated` either", function()
+    local marker = { fetched = { u1 = { file = "1.cbz", at = 1, updated = 1 } } }
+    assert(Marker.markFetched(marker, "u1", "1.cbz", 100, 90) == false)
+    assert(marker.fetched.u1.at == 1 and marker.fetched.u1.updated == 1)
+end)
+
+-- ─── markReplaced ────────────────────────────────────────────────────────
+
+test("markReplaced: updates at and updated of an existing entry", function()
+    local marker = { fetched = { u1 = { file = "1.cbz", at = 1 } } }
+    assert(Marker.markReplaced(marker, "u1", "1.cbz", 200, 150) == true)
+    local r = marker.fetched.u1
+    assert(r.file == "1.cbz" and r.at == 200 and r.updated == 150)
+end)
+
+test("markReplaced: fills in a missing file name (seeded entry)", function()
+    local marker = { fetched = { u1 = { at = 1 } } }
+    Marker.markReplaced(marker, "u1", "1.cbz", 200, 150)
+    assert(marker.fetched.u1.file == "1.cbz")
+end)
+
+test("markReplaced: keeps the recorded file name when none is given", function()
+    local marker = { fetched = { u1 = { file = "1.cbz", at = 1 } } }
+    Marker.markReplaced(marker, "u1", nil, 200, 150)
+    assert(marker.fetched.u1.file == "1.cbz")
+end)
+
+test("markReplaced: creates the entry when absent", function()
+    local marker = {}
+    assert(Marker.markReplaced(marker, "u1", "1.cbz", 200, 150) == true)
+    assert(marker.fetched.u1.at == 200 and marker.fetched.u1.updated == 150)
+end)
+
+test("write/read: `updated` round-trips", function()
+    local deps = fs()
+    assert(Marker.write("/m/S", { fetched = { u1 = { file = "1.cbz", at = 9, updated = 8.5 } } }, deps))
+    assert(Marker.read("/m/S", deps).fetched.u1.updated == 8.5)
+end)
+
 print(string.format("%d/%d tests passed", pass, pass + fail))
 if fail > 0 then os.exit(1) end
