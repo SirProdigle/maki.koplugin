@@ -29,6 +29,11 @@ local DNS_RETRY_DELAY = 30      -- seconds between readiness probes
 local DNS_MAX_RETRIES = 6       -- ~3 minutes of grace after connect
 -- Coalesce the duplicate NetworkConnected events KOReader emits on associate.
 local NETWORK_EVENT_DEBOUNCE = 10
+-- Android: Onyx switches Wi-Fi off in standby and back on a few seconds
+-- after wake, and KOReader gets no NetworkConnected when it returns. A
+-- resume-triggered sync would find itself offline and give up; poll instead.
+local OFFLINE_RETRY_DELAY = 5
+local OFFLINE_MAX_RETRIES = 12  -- a minute
 -- How often the parent checks on the forked sync child.
 local SYNC_POLL_SECONDS = 2
 
@@ -206,6 +211,7 @@ function OPDS:_onNetworkConnected()
     end
     self.last_network_event = now
     self.dns_retries = 0
+    self.offline_retries = 0
     UIManager:scheduleIn(0.5, function()
         self:performAutoSync()
     end)
@@ -215,6 +221,7 @@ function OPDS:_onResume()
     logger.info("OPDS: Resumed, checking auto-sync")
     if self.settings.sync_on_resume then
         self.dns_retries = 0
+        self.offline_retries = 0
         UIManager:scheduleIn(2, function()
             self:performAutoSync()
         end)
@@ -281,9 +288,23 @@ function OPDS:performAutoSync()
     -- Check network connectivity
     local NetworkMgr = require("ui/network/manager")
     if not NetworkMgr:isOnline() then
-        logger.info("OPDS: Not online, skipping auto-sync")
+        self.offline_retries = (self.offline_retries or 0) + 1
+        self.offline_retry_task = self.offline_retry_task or function()
+            self:performAutoSync()
+        end
+        UIManager:unschedule(self.offline_retry_task)
+        if self.offline_retries <= OFFLINE_MAX_RETRIES then
+            logger.info("OPDS: Not online yet, retry", self.offline_retries, "of",
+                        OFFLINE_MAX_RETRIES, "in", OFFLINE_RETRY_DELAY, "s")
+            UIManager:scheduleIn(OFFLINE_RETRY_DELAY, self.offline_retry_task)
+        else
+            logger.info("OPDS: Still offline, skipping auto-sync")
+            self.offline_retries = 0
+        end
         return
     end
+    if self.offline_retry_task then UIManager:unschedule(self.offline_retry_task) end
+    self.offline_retries = 0
 
     -- Maki: isOnline() isn't enough right after a reboot — the resolver lags
     -- the interface. Retry a few times before giving up quietly, rather than
