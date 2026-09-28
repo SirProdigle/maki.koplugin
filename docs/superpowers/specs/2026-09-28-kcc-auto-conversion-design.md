@@ -24,8 +24,10 @@ it already has with the converted versions.
   keyed by URL and a fetched URL is never looked at again. The acquisition URL
   contains book ID + filename, so **a file replaced in place under the same
   name is invisible to Maki today.**
-- Komga OPDS entries carry `<updated>` (ISO-8601 with offset), which is the
-  change signal this design relies on.
+- Komga's REST API reports each book's file size (`sizeBytes` from
+  `GET /api/v1/series/{seriesId}/books`), which is the change signal this
+  design relies on. OPDS `<updated>` was the original choice and was
+  rejected during rollout testing (see Component 2).
 - Progress push-back (tana → Komga REST), "Continue from server" and the
   AniList bridge all key on Komga book IDs; the bridge also relies on chapter
   numbers from `ComicInfo.xml`.
@@ -38,8 +40,8 @@ it already has with the converted versions.
 Convert **in place**: same path, same filename. Komga keeps the same book ID,
 so every ID-keyed integration keeps working unchanged. The original is kept
 only as a temporary copy during conversion and deleted once the converted file
-is verified and swapped in. Maki learns to compare the feed's `<updated>`
-against what it downloaded and re-fetch changed chapters.
+is verified and swapped in. Maki learns to compare the server's file size
+against the local copy and re-fetch changed chapters.
 
 Rejected: a separate KCC library in Komga (new book IDs → migrate Boox
 markers, progress push-back and bridge library IDs; every series shown twice),
@@ -81,7 +83,7 @@ configuration in the converter state.
 ## Architecture
 
 ```
-Suwayomi ──writes CBZ──▶ /data/nas/media/manga ◀──reads (ro)── Komga ──OPDS <updated>──▶ Maki (Boox)
+Suwayomi ──writes CBZ──▶ /data/nas/media/manga ◀──reads (ro)── Komga ──REST sizeBytes──▶ Maki (Boox)
                                ▲                                  ▲
                     manga-kcc ─┘ convert in place                 └─ POST scan after each batch
 ```
@@ -128,9 +130,13 @@ code path and exits (used for rollout step 1 and debugging).
 5. Copy the output next to the original as `<name>.kcc-tmp`, apply the
    original's uid/gid/mode, then `os.replace` it over the original (atomic
    within the directory, same filename).
-6. Record `{path: {size, mtime, settings: "kcc-f127adb-go103-v1", at}}` in
+6. Touch the series directory (update its mtime). The NAS's pooled
+   filesystem does not update a directory's mtime on rename, and Komga only
+   rescans a series whose folder mtime changed — without this the swap is
+   invisible to Komga (stale `sizeBytes`, stale file hash).
+7. Record `{path: {size, mtime, settings: "kcc-f127adb-go103-v1", at}}` in
    `state.json` (written atomically via temp + rename).
-7. Delete the safety copy and job dir.
+8. Delete the safety copy and job dir.
 
 **Failure handling.** Any failure in steps 3–5: remove `.kcc-tmp` and the job
 dir, leave the original untouched (it was never moved), increment the file's
@@ -147,38 +153,57 @@ Komga or Suwayomi sees the path missing.
 
 All changes in `maki.koplugin`.
 
-1. **Parser.** Capture each OPDS entry's `<updated>` into the item table
-   (`item.updated`, raw string).
-2. **Timestamp parsing.** New pure helper converting ISO-8601 with offset
-   (`2026-05-14T03:40:29.471+01:00`, also `Z`) to a UTC epoch number.
-   Unparseable → `nil` (treated as "no change info").
-3. **Ledger.** `fetched[url] = {file, at, updated}` where `updated` is the
-   server epoch at the time of download. `Marker.markFetched` gains an update
-   path (currently it never overwrites an entry) used only after a successful
-   replacement.
-4. **Planning.** `collect_entries` passes `updated` through. `planSeries`, for
-   a URL already in the ledger whose file exists locally, plans a **replace**
-   when `server_updated > (rec.updated or rec.at)`. Legacy entries have no
-   `updated`, so their download time `at` is used; every chapter converted
-   after it was downloaded therefore gets refreshed once, with no migration
-   step.
-5. **Replace.** Download to `<path>.part` as today, then rename over the
-   existing file. The `.sdr` sidecar is left alone (page counts are unchanged,
-   so progress stays valid). Update the ledger entry's `at` and `updated`.
-6. **Open document.** A replace is skipped for the document currently open in
-   the reader (passed in via `deps`), and retried next sync.
-7. **Caps.** Replacements count against the existing per-run download cap, so
-   the initial refresh spreads across several syncs.
+**Why not OPDS `<updated>`.** The first design compared each OPDS entry's
+`<updated>` with the ledger. Rollout testing on the real Komga showed it is
+not a per-book signal: when Komga rescans a series (which it does whenever
+the series folder mtime changes) it bumps `<updated>`/`lastModified` on
+*every* book in that series, touched or not. Converting one chapter changed
+`<updated>` on all 95 books of the series, so Maki would have re-downloaded
+whole series. The file size is per-book and changes whenever KCC rewrites a
+chapter (converted files are ~1.5x the original).
+
+1. **Server sizes.** Once per followed series per sync, only when the
+   series feed is a Komga OPDS feed (`…/opds/v1.2/series/{seriesId}`), Maki
+   calls `GET {base}/api/v1/series/{seriesId}/books?unpaged=true` with the
+   same HTTP basic credentials it uses for OPDS and builds
+   `{bookId → sizeBytes}`. `{base}` is everything before `/opds/` in the
+   feed URL. The book id comes from the acquisition URL
+   (`…/opds/v1.2/books/{bookId}/file/…`). The call is skipped when the
+   ledger is empty (nothing to compare). Any failure — non-200, bad JSON,
+   unexpected shape, non-Komga feed — means no size info for that series:
+   logged, no replacements, the sync carries on.
+2. **Planning.** `planSeries`, for a URL already in the ledger whose file
+   exists locally, plans a **replace** iff the server size is known and
+   differs from the local file size (`lfs.attributes(path, "size")`).
+   Unknown size → no replace. Legacy ledger entries (`{file, at}`) need
+   nothing special. Seeded entries without a `file` resolve their filename
+   (HEAD) once, only when a server size is known, and record it.
+3. **Replace.** Download to `<path>.part` as today, check the `.part` size
+   equals the server size (a truncated transfer or a file that changed again
+   mid-sync is discarded, original kept, retried next sync; this does not
+   count towards the consecutive-failure abort), then rename over the
+   existing file. The `.sdr` sidecar is left alone (page counts are
+   unchanged, so progress stays valid). `Marker.markReplaced` refreshes the
+   ledger entry's `at`. A failed replace leaves the original and the ledger
+   untouched.
+4. **Open document.** A replace is skipped for the document currently open
+   in the reader. The parent captures its path (realpath) into
+   `deps.openFile` before forking the sync child; it is retried next sync.
+5. **Caps and reporting.** Replacements count against the existing per-run
+   download cap, so the initial refresh spreads across several syncs. They
+   are counted separately (`replaced`) in progress, the manual summary and
+   the auto-sync notification.
 
 ## Rollout
 
 1. Build the image. Convert one chapter manually with the container's
    converter (`--once --path <file>`).
-2. Verify in Komga: book ID unchanged, `<updated>` in the OPDS feed is newer,
+2. Verify in Komga: book ID unchanged, `sizeBytes` reflects the converted file,
    page count unchanged, metadata (number/title) intact.
-3. Trigger a library scan with no file changes and verify `<updated>` does
-   **not** change for untouched books. If it does, stop: the change signal
-   needs revisiting before the Maki change ships.
+3. Verify `sizeBytes` in `GET /api/v1/series/{id}/books` changed for the
+   converted book only, and is unchanged for the others. (This step, run
+   against `<updated>`, is what showed `<updated>` changes on every book of a
+   rescanned series — hence the size signal.)
 4. Deploy Maki to the Boox; run a sync of that one series and confirm only
    the converted chapter is re-downloaded.
 5. Start the container for the backfill. Watch the first pass; spot-check a
@@ -192,10 +217,12 @@ All changes in `maki.koplugin`.
   (page count, ComicInfo), failure counting. One integration test converts a
   small fixture CBZ inside the image.
 - **Maki:** plain-Lua test scripts in `maki.koplugin/tests/` (repo style:
-  `lua tests/_test_*.lua`). Cases: ISO-8601 parsing (offsets, `Z`, fractional
-  seconds, garbage); `planSeries` plans a replace when server is newer than
-  `updated`, and when newer than `at` for a legacy entry; no replace when equal
-  or older; no replace for the open document; replace respects the cap.
+  `lua tests/_test_*.lua`). Cases: Komga URL helpers (series feed → REST URL,
+  acquisition URL → book id) and response parsing; `planSeries` plans a
+  replace when sizes differ, none when equal or when the server size is
+  unknown; REST failure / bad JSON / non-Komga feed → no replacements and the
+  sync continues; no replace for the open document; a wrong-size download is
+  discarded; replacements respect the cap.
 
 ## Trade-offs
 
@@ -203,5 +230,11 @@ All changes in `maki.koplugin`.
   re-convert from source; chapters would need re-downloading through
   Suwayomi (delete the files and let Suwayomi re-fetch).
 - Converted files are larger than the originals (~1.5x).
-- If Komga ever bumps `<updated>` for reasons other than file content, the Boox
-  re-downloads those chapters unnecessarily. Rollout step 3 checks this.
+- Change detection is by size only. A server-side change that keeps the
+  byte count identical is not detected; for KCC conversion (~1.5x growth)
+  this does not happen in practice.
+- One extra REST call per followed series per sync (skipped for series with
+  an empty ledger). A Komga that has not rescanned since a conversion still
+  reports the old size, so the Boox picks the change up after Komga's next
+  scan of that series (the converter's directory touch + scan request
+  trigger it).
