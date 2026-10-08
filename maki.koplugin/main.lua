@@ -425,6 +425,13 @@ function OPDS:_syncDeps(progress_path)
         fileSize = function(p) return lfs.attributes(p, "size") end,
         fetchJSON = fetchJSON,
         remove = function(p) return os.remove(p) end,
+        -- Reading position etc. of a chapter swept because the server no
+        -- longer has it (see makisync sweepVanished).
+        removeSidecar = function(p)
+            local DocSettings = require("docsettings")
+            local ds = DocSettings:open(p)
+            if ds and ds.purge then ds:purge() end
+        end,
         rename = function(a, b) return os.rename(a, b) end,
         now = os.time,
     }
@@ -548,7 +555,7 @@ function OPDS:_pollSync()
         local ok, r = pcall(chunk or function() end)
         if ok and type(r) == "table" then result = r end
     end
-    result = result or { series = {}, downloaded = 0, replaced = 0, failed = 0, adopted = 0,
+    result = result or { series = {}, downloaded = 0, replaced = 0, removed = 0, failed = 0, adopted = 0,
                          aborted = true, reason = "no result from child" }
     -- A terminated child never gets to write its result, so the pipe is empty
     -- or truncated. Report it as cancelled (not aborted) so the summary is
@@ -566,7 +573,9 @@ end
 
 function OPDS:_finishSync(result, was_manual)
     result.replaced = result.replaced or 0
+    result.removed = result.removed or 0
     logger.info("Maki: sync finished", "downloaded", result.downloaded, "replaced", result.replaced,
+                "removed", result.removed,
                 "failed", result.failed,
                 "adopted", result.adopted, "aborted", tostring(result.aborted),
                 "cancelled", tostring(result.cancelled), result.reason or "")
@@ -581,8 +590,8 @@ function OPDS:_finishSync(result, was_manual)
     end
     if was_manual then
         UIManager:show(InfoMessage:new{
-            text = T(_("Maki: %1 downloaded, %2 updated, %3 failed, %4 adopted%5"),
-                     result.downloaded, result.replaced, result.failed, result.adopted,
+            text = T(_("Maki: %1 downloaded, %2 updated, %3 removed, %4 failed, %5 adopted%6"),
+                     result.downloaded, result.replaced, result.removed, result.failed, result.adopted,
                      result.cancelled and _("\n(cancelled)")
                         or (result.aborted and ("\n" .. tostring(result.reason)) or "")),
             timeout = 6,
@@ -597,7 +606,7 @@ function OPDS:_finishSync(result, was_manual)
     elseif result.aborted then
         logger.warn("Maki: auto-sync aborted:", result.reason)
     end
-    if result.downloaded > 0 or result.replaced > 0 then self:_refreshFileManager() end
+    if result.downloaded > 0 or result.replaced > 0 or result.removed > 0 then self:_refreshFileManager() end
 end
 
 function OPDS:_refreshFileManager()

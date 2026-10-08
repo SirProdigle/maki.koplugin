@@ -640,5 +640,97 @@ test("runSync: progress reports replacements", function()
     assert(seen and seen.replaced == 1 and seen.downloaded == 0)
 end)
 
+-- ─── re-issued and vanished chapters ─────────────────────────────────────
+
+test("runSync: file adopted under a new book id with a different size is replaced", function()
+    -- server re-issued chapter 1 as book b9 (same file name, new content)
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b9")), acq(K("b2")) }) },
+                      names = { [K("b9")] = "c1.cbz" },
+                      rest = { [KREST] = books({ b9 = 150, b2 = 200 }) },
+                      dl_sizes = { [K("b9")] = 150 } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.adopted == 1 and r.replaced == 1, "adopted=" .. r.adopted .. " replaced=" .. r.replaced)
+    assert(w.files["/m/S/c1.cbz"] == 150, "new content in place")
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched[K("b9")].file == "c1.cbz")
+    assert(mk.fetched[K("b1")] == nil, "stale ledger entry forgotten")
+    assert(r.removed == 0, "shared file name must not be swept")
+end)
+
+test("runSync: chapter replaced under a new file name — old file swept after the new one lands", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b9")), acq(K("b2")) }) },
+                      names = { [K("b9")] = "Official_# 1.cbz" },
+                      rest = { [KREST] = books({ b9 = 300, b2 = 200 }) } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "Unknown_# 1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/Unknown_# 1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
+    local swept_sidecars = {}
+    w.deps.removeSidecar = function(p) swept_sidecars[#swept_sidecars + 1] = p end
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.downloaded == 1 and r.removed == 1, "downloaded=" .. r.downloaded .. " removed=" .. r.removed)
+    assert(w.files["/m/S/Official_# 1.cbz"] and w.files["/m/S/Unknown_# 1.cbz"] == nil)
+    assert(swept_sidecars[1] == "/m/S/Unknown_# 1.cbz")
+    assert(r.series[1].removed == 1)
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched[K("b1")] == nil and mk.fetched[K("b9")])
+end)
+
+test("runSync: no sweep when the replacement download failed", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b9")), acq(K("b2")) }) },
+                      names = { [K("b9")] = "Official_# 1.cbz" },
+                      fail_urls = { [K("b9")] = true } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "Unknown_# 1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/Unknown_# 1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.removed == 0 and w.files["/m/S/Unknown_# 1.cbz"], "old file kept until the new one lands")
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched[K("b1")], "ledger entry kept for the next sync")
+end)
+
+test("runSync: the open document is never swept", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b2")) }) } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
+    w.deps.openFile = "/m/S/c1.cbz"
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.removed == 0 and w.files["/m/S/c1.cbz"])
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched[K("b1")], "kept so it is swept once closed")
+end)
+
+test("runSync: a feed sharing nothing with the ledger never sweeps", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("x1")) }) }, names = { [K("x1")] = "x1.cbz" } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.removed == 0 and w.files["/m/S/c1.cbz"])
+end)
+
+test("runSync: ignore_ledger never sweeps", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b2")) }) } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/c1.cbz"] = 100; w.files["/m/S/c2.cbz"] = 200
+    local r = S.runSync(SERVERS, {}, w.deps, { ignore_ledger = true })
+    assert(r.removed == 0 and w.files["/m/S/c1.cbz"])
+end)
+
+test("runSync: a chapter deleted locally on purpose and gone upstream just leaves the ledger", function()
+    local w = world({ feeds = { [KFEED] = page({ acq(K("b2")) }) } })
+    w.dirs["/m"] = { "S" }
+    w.seed("/m/S", "C", KFEED, { [K("b1")] = { file = "c1.cbz", at = 1 }, [K("b2")] = { file = "c2.cbz", at = 1 } })
+    w.files["/m/S/c2.cbz"] = 200
+    local r = S.runSync(SERVERS, {}, w.deps, {})
+    assert(r.removed == 0)
+    local mk = dofile_string(w.markers["/m/S/.maki.lua"])
+    assert(mk.fetched[K("b1")] == nil)
+end)
+
 print(string.format("%d/%d tests passed", pass, pass + fail))
 if fail > 0 then os.exit(1) end

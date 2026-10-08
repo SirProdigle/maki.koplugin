@@ -19,6 +19,7 @@
 --   openFile                  -> path of the document open in the reader, or nil
 --                                (optional; captured by the parent before forking)
 --   realpath(path)            -> canonical path | nil    (optional; used to match openFile)
+--   removeSidecar(path)       -> nil                     (optional; drops a swept file's reader sidecar)
 --
 -- Change detection: file size. For a Komga series feed, one REST call per
 -- series per sync (/api/v1/series/{id}/books) yields every book's
@@ -26,6 +27,14 @@
 -- disk is re-downloaded ("replace") when the server size is known and
 -- differs from the local size. OPDS <updated> is NOT usable: Komga bumps it
 -- on every book of a series whenever it rescans that series.
+--
+-- Removal: a ledger URL the server no longer lists is a chapter that was
+-- deleted or replaced upstream (Suwayomi re-posting it under a new release
+-- writes a new file; manga-refresh retires the old one). Its local file is
+-- swept so the device does not keep a stale duplicate — unless another
+-- current chapter still uses that file name (a re-issued book id over the
+-- same file), it is the open document, or anything about the sync of that
+-- series went wrong.
 
 local logger = require("logger")
 local Marker = require("makimarker")
@@ -101,6 +110,13 @@ function M.planSeries(entries, dir, marker, deps)
                         Marker.markFetched(marker, e.url, fname, deps.now())
                         plan.adopted = plan.adopted + 1
                         plan.changed = true
+                        -- A file adopted under a new book id (the server
+                        -- re-issued the chapter) may hold the old content:
+                        -- the same size check as any ledger entry.
+                        local r = plan_replace(e, marker.fetched[e.url], dir, deps, plan)
+                        if type(r) == "table" then
+                            plan.to_fetch[#plan.to_fetch + 1] = r
+                        end
                     else
                         if deps.exists(path .. ".part") then deps.remove(path .. ".part") end
                         plan.to_fetch[#plan.to_fetch + 1] = {
@@ -195,10 +211,54 @@ local function collect_entries(feed_url, deps)
     return entries
 end
 
+-- Ledger entries the server no longer lists: forget them, and delete their
+-- local file when no current chapter uses that name. `prior` is the set of
+-- ledger URLs from before this sync. Returns files removed, ledger changed.
+function M.sweepVanished(entries, dir, marker, deps, prior)
+    dir = strip_slash(dir)
+    local listed, kept_files = {}, {}
+    for _, e in ipairs(entries) do
+        if e.url then listed[e.url] = true end
+    end
+    local still_known = false
+    for url, rec in pairs(marker.fetched or {}) do
+        if listed[url] then
+            if not prior or prior[url] then still_known = true end
+            if type(rec) == "table" and rec.file then kept_files[rec.file] = true end
+        end
+    end
+    -- An empty feed, or one sharing nothing with the ledger as it was before
+    -- this sync, is not this
+    -- series any more (or the server is confused): never sweep on it.
+    if not still_known then return 0, false end
+    local removed, changed = 0, false
+    for url, rec in pairs(marker.fetched) do
+        if not listed[url] then
+            local fname = type(rec) == "table" and rec.file or nil
+            local path = fname and (dir .. "/" .. fname)
+            if path and not kept_files[fname] and deps.exists(path) then
+                if is_open(path, deps) then
+                    logger.info("Maki: not removing the open document", path)
+                    goto continue
+                end
+                -- Sidecar first: its location can depend on the file itself.
+                if deps.removeSidecar then pcall(deps.removeSidecar, path) end
+                deps.remove(path)
+                logger.info("Maki: removed chapter no longer on the server", path)
+                removed = removed + 1
+            end
+            marker.fetched[url] = nil
+            changed = true
+        end
+        ::continue::
+    end
+    return removed, changed
+end
+
 local function sync_one_series(server, followed, deps, opts, result, state)
     local marker, dir = followed.marker, followed.dir
     local rec = { title = marker.title or dir:match("[^/]+$"), dir = dir,
-                  downloaded = 0, replaced = 0, failed = 0, adopted = 0, feed_failed = false }
+                  downloaded = 0, replaced = 0, removed = 0, failed = 0, adopted = 0, feed_failed = false }
     result.series[#result.series + 1] = rec
 
     local entries, err = collect_entries(marker.feed, deps)
@@ -208,6 +268,9 @@ local function sync_one_series(server, followed, deps, opts, result, state)
         return
     end
     state.feeds_ok = state.feeds_ok + 1
+
+    local prior = {}
+    for url in pairs(marker.fetched or {}) do prior[url] = true end
 
     local plan_marker = marker
     if opts.ignore_ledger then
@@ -288,6 +351,16 @@ local function sync_one_series(server, followed, deps, opts, result, state)
         end
     end
 
+    -- Sweep only after a clean pass over this series: a chapter replaced
+    -- under a new file name must have its replacement on disk first.
+    local clean = rec.failed == 0 and not (result.capped or result.cancelled or result.aborted)
+    if clean and not opts.ignore_ledger then
+        local removed, swept = M.sweepVanished(entries, dir, marker, deps, prior)
+        rec.removed = removed
+        result.removed = result.removed + removed
+        if swept then plan.changed = true end
+    end
+
     if plan.changed then
         local wok, werr = Marker.write(dir, marker, deps.marker)
         if not wok then logger.warn("Maki: marker write failed", dir, werr) end
@@ -298,7 +371,7 @@ end
 -- opts: { server_index = n|nil, ignore_ledger = bool }
 function M.runSync(servers, settings, deps, opts)
     opts = opts or {}
-    local result = { series = {}, downloaded = 0, replaced = 0, failed = 0, adopted = 0,
+    local result = { series = {}, downloaded = 0, replaced = 0, removed = 0, failed = 0, adopted = 0,
                      aborted = false, capped = false, cancelled = false, reason = nil }
     -- sync_max_dl: 0 or unset means no limit.
     local max_dl = settings.sync_max_dl
@@ -337,9 +410,9 @@ function M.runSync(servers, settings, deps, opts)
     -- did something are worth reporting; the totals carry the rest.
     local reported = {}
     for _, rec in ipairs(result.series) do
-        if rec.downloaded > 0 or rec.replaced > 0 or rec.failed > 0 or rec.feed_failed then
+        if rec.downloaded > 0 or rec.replaced > 0 or rec.removed > 0 or rec.failed > 0 or rec.feed_failed then
             reported[#reported + 1] = { title = rec.title, downloaded = rec.downloaded,
-                                        replaced = rec.replaced, failed = rec.failed,
+                                        replaced = rec.replaced, removed = rec.removed, failed = rec.failed,
                                         feed_failed = rec.feed_failed or nil }
         end
     end
